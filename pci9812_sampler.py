@@ -58,64 +58,91 @@ def _find_dask_dll():
     )
 
 
-def _read_constant_from_header(name):
+def _load_dask_constants():
     """
-    Parse a #define value from dask.h.
-    Searches the same directories as the DLL so the value is always correct.
+    Parse all required #define values from dask.h.
+    Returns a dict of name -> int.  Prints each value found.
     """
     import re
-    pattern = re.compile(rf'^\s*#define\s+{re.escape(name)}\s+(\w+)', re.MULTILINE)
+    needed = [
+        'PCI_9812',
+        'AD_B_5_V', 'AD_B_1_V',
+        'P9812_TRGMOD_SOFT', 'P9812_TRGMOD_POST', 'P9812_TRGMOD_PRE',
+        'P9812_TRGMOD_MIDL', 'P9812_TRGMOD_DELY',
+        'P9812_TRGSRC_CH0', 'P9812_TRGSRC_CH1', 'P9812_TRGSRC_CH2',
+        'P9812_TRGSRC_CH3', 'P9812_TRGSRC_EXT',
+        'P9812_TRGSLP_POS', 'P9812_TRGSLP_NEG',
+        'P9812_CLKSRC_INT', 'P9812_CLKSRC_SIN', 'P9812_CLKSRC_SQR',
+        'P9812_AD2_GT_PCI',
+        'SYNCH_OP', 'ASYNCH_OP',
+    ]
+    pattern = re.compile(
+        r'^\s*#define\s+(' + '|'.join(re.escape(n) for n in needed) + r')\s+(0[xX][0-9a-fA-F]+|\d+)',
+        re.MULTILINE,
+    )
+
     for d in _ADLINK_DIRS:
         for subdir in ('', 'Include', 'include'):
             header = os.path.join(d, subdir, 'dask.h')
             if os.path.isfile(header):
-                text = open(header).read()
-                m = pattern.search(text)
-                if m:
-                    val = m.group(1)
-                    result = int(val, 16) if val.startswith('0x') or val.startswith('0X') else int(val)
-                    print(f'dask.h: {name} = {result}  (from {header})')
-                    return result
-    return None
+                print(f'Loading constants from: {header}')
+                text  = open(header).read()
+                found = {}
+                for m in pattern.finditer(text):
+                    name, val = m.group(1), m.group(2)
+                    found[name] = int(val, 16) if val.lower().startswith('0x') else int(val)
+                for name in needed:
+                    if name in found:
+                        print(f'  {name} = {found[name]}')
+                    else:
+                        print(f'  WARNING: {name} not found in header')
+                return found
+
+    print('WARNING: dask.h not found — using built-in fallback constants (may be wrong).')
+    return {}
+
+
+_H = _load_dask_constants()
+
+def _c(name, fallback):
+    if name not in _H:
+        print(f'  WARNING: using fallback {name}={fallback}')
+    return _H.get(name, fallback)
 
 
 # ---------------------------------------------------------------------------
-# Constants — read from dask.h where possible, fall back to known values
+# Constants — sourced from dask.h (fallbacks shown if header missing)
 # ---------------------------------------------------------------------------
 
-_PCI_9812_FROM_HEADER = _read_constant_from_header('PCI_9812')
-PCI_9812 = _PCI_9812_FROM_HEADER if _PCI_9812_FROM_HEADER is not None else 17
-if _PCI_9812_FROM_HEADER is None:
-    print(f'WARNING: dask.h not found — using PCI_9812={PCI_9812} (may be wrong). '
-          f'Check your ADLINK SDK Include folder.')
+PCI_9812          = _c('PCI_9812',          30)
 
-AD_B_5_V  = 1   # Bipolar ±5 V
-AD_B_1_V  = 3   # Bipolar ±1 V
+AD_B_5_V          = _c('AD_B_5_V',           1)
+AD_B_1_V          = _c('AD_B_1_V',           3)
 
-P9812_TRGMOD_SOFT = 0
-P9812_TRGMOD_POST = 1
-P9812_TRGMOD_PRE  = 2
-P9812_TRGMOD_MIDL = 3
-P9812_TRGMOD_DELY = 4
+P9812_TRGMOD_SOFT = _c('P9812_TRGMOD_SOFT',  0)
+P9812_TRGMOD_POST = _c('P9812_TRGMOD_POST',  1)
+P9812_TRGMOD_PRE  = _c('P9812_TRGMOD_PRE',   2)
+P9812_TRGMOD_MIDL = _c('P9812_TRGMOD_MIDL',  3)
+P9812_TRGMOD_DELY = _c('P9812_TRGMOD_DELY',  4)
 
-P9812_TRGSRC_CH0  = 0
-P9812_TRGSRC_CH1  = 1
-P9812_TRGSRC_CH2  = 2
-P9812_TRGSRC_CH3  = 3
-P9812_TRGSRC_EXT  = 4
+P9812_TRGSRC_CH0  = _c('P9812_TRGSRC_CH0',   0)
+P9812_TRGSRC_CH1  = _c('P9812_TRGSRC_CH1',   1)
+P9812_TRGSRC_CH2  = _c('P9812_TRGSRC_CH2',   2)
+P9812_TRGSRC_CH3  = _c('P9812_TRGSRC_CH3',   3)
+P9812_TRGSRC_EXT  = _c('P9812_TRGSRC_EXT',   4)
 
-P9812_TRGSLP_POS  = 0
-P9812_TRGSLP_NEG  = 1
+P9812_TRGSLP_POS  = _c('P9812_TRGSLP_POS',   0)
+P9812_TRGSLP_NEG  = _c('P9812_TRGSLP_NEG',   1)
 
-P9812_CLKSRC_INT  = 0x0000
-P9812_CLKSRC_SIN  = 0x0004
-P9812_CLKSRC_SQR  = 0x0008
-P9812_AD2_GT_PCI  = 0x0002
+P9812_CLKSRC_INT  = _c('P9812_CLKSRC_INT',   0x0000)
+P9812_CLKSRC_SIN  = _c('P9812_CLKSRC_SIN',   0x0004)
+P9812_CLKSRC_SQR  = _c('P9812_CLKSRC_SQR',   0x0008)
+P9812_AD2_GT_PCI  = _c('P9812_AD2_GT_PCI',   0x0002)
 
-SYNCH_OP   = 0
-ASYNCH_OP  = 1
+SYNCH_OP          = _c('SYNCH_OP',           0)
+ASYNCH_OP         = _c('ASYNCH_OP',          1)
 
-ADC_MID    = 2048   # 12-bit midpoint for voltage conversion
+ADC_MID           = 2048   # 12-bit midpoint for voltage conversion
 
 
 # ---------------------------------------------------------------------------
