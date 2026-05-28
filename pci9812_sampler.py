@@ -12,11 +12,16 @@ Driver: PCIS-DASK.dll  (install ADLINK PCIS-DASK driver package first)
 """
 
 import ctypes
-import ctypes.wintypes
 import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+
+if sys.platform != "win32":
+    raise RuntimeError(
+        "PCIS-DASK.dll is a Windows-only driver. "
+        "This script must run on a Windows machine with the ADLINK driver installed."
+    )
 
 # ---------------------------------------------------------------------------
 # PCIS-DASK constants
@@ -118,7 +123,7 @@ class PCI9812:
     def open(self):
         """Load DLL and initialise the card."""
         try:
-            self._dll = ctypes.WinDLL(self.DLL_NAME)
+            self._dll = ctypes.CDLL(self.DLL_NAME)
         except OSError as exc:
             raise RuntimeError(
                 f"Cannot load {self.DLL_NAME}. "
