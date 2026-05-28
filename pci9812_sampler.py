@@ -333,14 +333,13 @@ def plot_fft(ch_data, sample_rate):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    card_num    = 0             # <-- change this if you have multiple cards
     channel     = 3
     ad_range    = AD_B_5_V
     file_name   = '9812d'
     read_count  = 4000
     sample_rate = 20000.0
     duration_s  = 5.0
-
-    card_num = int(input('Please input a card number: '))
 
     ch_data, sr = acquire(
         channel, ad_range, file_name, read_count, sample_rate,
