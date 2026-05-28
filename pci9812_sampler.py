@@ -64,7 +64,7 @@ ADC_MID    = 2048   # 12-bit midpoint for voltage conversion
 class DASK:
     """ctypes wrapper around DASK.dll — mirrors the C API exactly."""
 
-    DLL_NAME = 'DASK.dll'
+    DLL_NAME = 'PCI-DASK.dll'
 
     def __init__(self):
         try:
