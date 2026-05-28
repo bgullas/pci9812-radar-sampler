@@ -1,14 +1,11 @@
 """
-wave_monitor.py  —  Sea Wave Monitoring from Radar Backscatter
+wave_monitor.py  —  Shore-based Sea Wave Monitoring (180° seaward view)
 
-Technique: wave crests reflect more radar energy than troughs. The periodic
-amplitude pattern in the range profile encodes wavelength and propagation.
-
-Four analysis panels:
-  1. PPI          — full radar image, wave monitoring sector highlighted
-  2. Wave Profile — 1D amplitude slice along wave direction, peaks counted
-  3. Temporal     — amplitude at fixed range over time, shows wave period
-  4. Waterfall    — range × time, diagonal bands = wave propagation speed
+Three-panel layout:
+  Left        : 180° semicircular PPI (seaward), JONSWAP waves + shadow + speckle,
+                Stokes drift current vectors, coloured wave-analysis boxes
+  Upper-right : 1D range profile along dominant wave direction, peak counting
+  Lower-right : 2D wavenumber spectrum (k-space) from wave components
 """
 
 import numpy as np
@@ -16,142 +13,239 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
-from collections import deque
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Radar / hardware constants
+# Radar / display constants
 # ─────────────────────────────────────────────────────────────────────────────
-SAMPLE_RATE_HZ = 20_000_000
-RPM            = 42
-RANGE_NM       = 3.0
+SAMPLE_RATE_HZ  = 20_000_000
+RPM             = 42
+RANGE_NM        = 2.0
 
-C              = 299_792_458
-METERS_PER_NM  = 1852
-MAX_RANGE_M    = RANGE_NM * METERS_PER_NM        # 5 556 m
-RANGE_RES_M    = C / (2 * SAMPLE_RATE_HZ)        # 7.49 m / bin
-N_RANGE_BINS   = int(MAX_RANGE_M / RANGE_RES_M)  # ~741
-REV_PER_S      = RPM / 60                        # 0.7
-PERIOD_S       = 1.0 / REV_PER_S                 # 1.43 s / rev
-N_BEARINGS     = 512
+C               = 299_792_458
+METERS_PER_NM   = 1852
+MAX_RANGE_M     = RANGE_NM * METERS_PER_NM          # 3 704 m
+RANGE_RES_M     = C / (2 * SAMPLE_RATE_HZ)          # 7.49 m/bin
+N_RANGE_BINS    = int(MAX_RANGE_M / RANGE_RES_M)     # ~494
+REV_PER_S       = RPM / 60
+PERIOD_S        = 1.0 / REV_PER_S
+N_BEARINGS      = 512
+SIM_SPEED       = 5          # simulated seconds per real antenna revolution
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Wave field definition
-# ─────────────────────────────────────────────────────────────────────────────
-# Each entry: wavelength (m), origin direction (deg, where waves come FROM),
-# relative amplitude (0–1), period (s).
-# Deep-water dispersion: T = 2π sqrt(λ / (2π g))
-WAVE_PARAMS = [
-    {'λ': 120, 'dir': 315, 'amp': 0.70, 'T':  8.8},  # primary NW swell
-    {'λ':  65, 'dir': 290, 'amp': 0.30, 'T':  6.5},  # secondary W swell
-    {'λ':  28, 'dir': 330, 'amp': 0.15, 'T':  4.2},  # short wind chop
+RADAR_HEIGHT_M  = 12         # antenna height above sea level — sets shadow length
+
+# ── JONSWAP sea-state parameters ─────────────────────────────────────────────
+PEAK_LAMBDA_M    = 110       # dominant wavelength (m)
+PEAK_DIR_DEG     = 315       # waves come FROM NW
+N_JONSWAP_COMP   = 52        # spectral components
+JONSWAP_GAMMA    = 3.3       # peak enhancement factor (3.3 = moderate fetch)
+DIR_SPREAD_KAPPA = 5.0       # von Mises concentration (higher = narrower spread)
+SEA_CLUTTER      = 0.11      # broadband clutter amplitude
+
+# ── Wave-analysis boxes overlaid on PPI ──────────────────────────────────────
+WAVE_BOXES = [
+    {'r': (400, 1280), 'b': 344, 'w': 15, 'color': '#ff4444', 'label': 'Box A  34°'},
+    {'r': (500, 1400), 'b':   4, 'w': 15, 'color': '#44ff88', 'label': 'Box B  44°'},
+    {'r': (700, 1700), 'b':  30, 'w': 15, 'color': '#4488ff', 'label': 'Box C  84°'},
+    {'r': (600, 1600), 'b':  58, 'w': 15, 'color': '#ffff44', 'label': 'Box D 134°'},
 ]
 
-DOMINANT_WAVE = WAVE_PARAMS[0]    # used for profile / counting
-SEA_CLUTTER   = 0.18              # background clutter level (0–1)
-SIM_SPEED     = 4                 # simulated seconds per real revolution
-                                  # (increase to speed up wave motion)
-
-MONITOR_RANGE_M   = 1500          # fixed range for temporal trace (m)
-MONITOR_BEARING   = DOMINANT_WAVE['dir']   # look along wave origin direction
-N_HISTORY_REVS    = 55            # waterfall rows (revolutions kept)
-N_TRACE_REVS      = 70            # temporal trace length (revolutions)
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Color maps
+# Colour maps
 # ─────────────────────────────────────────────────────────────────────────────
-RADAR_CMAP = LinearSegmentedColormap.from_list('radar_green', [
+RADAR_CMAP = LinearSegmentedColormap.from_list('radar', [
     (0.00, (0.00, 0.00, 0.00)),
-    (0.15, (0.00, 0.12, 0.04)),
-    (0.45, (0.00, 0.50, 0.16)),
-    (0.75, (0.10, 0.82, 0.28)),
-    (1.00, (0.75, 1.00, 0.65)),
+    (0.12, (0.00, 0.09, 0.03)),
+    (0.38, (0.00, 0.40, 0.12)),
+    (0.68, (0.07, 0.72, 0.24)),
+    (0.86, (0.46, 0.93, 0.48)),
+    (1.00, (0.88, 1.00, 0.78)),
 ])
 
-WATER_CMAP = LinearSegmentedColormap.from_list('water', [
-    (0.00, (0.00, 0.03, 0.12)),
-    (0.35, (0.00, 0.20, 0.50)),
-    (0.65, (0.00, 0.55, 0.85)),
-    (0.85, (0.40, 0.85, 1.00)),
-    (1.00, (1.00, 1.00, 1.00)),
+SPEC_CMAP = LinearSegmentedColormap.from_list('kspec', [
+    (0.00, (0.01, 0.02, 0.10)),
+    (0.28, (0.00, 0.14, 0.44)),
+    (0.58, (0.04, 0.48, 0.80)),
+    (0.82, (0.55, 0.90, 1.00)),
+    (1.00, (1.00, 1.00, 0.82)),
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pre-compute polar → Cartesian lookup for PPI
+# Pre-compute polar → Cartesian look-up for the PPI image
 # ─────────────────────────────────────────────────────────────────────────────
-PPI_SIZE   = 420
-_x = np.linspace(-MAX_RANGE_M,  MAX_RANGE_M, PPI_SIZE)
-_y = np.linspace( MAX_RANGE_M, -MAX_RANGE_M, PPI_SIZE)
-_XX, _YY   = np.meshgrid(_x, _y)
-_RR        = np.sqrt(_XX**2 + _YY**2)
-_BB        = np.degrees(np.arctan2(_XX, _YY)) % 360
-_RIDX      = np.clip((_RR / RANGE_RES_M).astype(np.int32), 0, N_RANGE_BINS - 1)
-_BIDX      = (_BB / 360.0 * N_BEARINGS).astype(np.int32) % N_BEARINGS
-_MASK      = _RR > MAX_RANGE_M
+PPI_SIZE = 480
 
-RANGE_AXIS = np.arange(N_RANGE_BINS) * RANGE_RES_M   # metres
+_px  = np.linspace(-MAX_RANGE_M,  MAX_RANGE_M, PPI_SIZE)
+_py  = np.linspace( MAX_RANGE_M, -MAX_RANGE_M, PPI_SIZE)   # y-decreasing → imshow upper
+_PX, _PY = np.meshgrid(_px, _py)
+_PR  = np.sqrt(_PX**2 + _PY**2)
+_PB  = np.degrees(np.arctan2(_PX, _PY)) % 360  # 0°=N, clockwise
+_PRIDX = np.clip((_PR / RANGE_RES_M).astype(np.int32), 0, N_RANGE_BINS - 1)
+_PBIDX = (_PB / 360.0 * N_BEARINGS).astype(np.int32) % N_BEARINGS
+# Land = southern half (y < 0) or outside range circle
+_LAND  = (_PY < -MAX_RANGE_M * 0.015) | (_PR > MAX_RANGE_M)
+
+RANGE_AXIS = np.arange(N_RANGE_BINS) * RANGE_RES_M
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Wave field generation
+# JONSWAP spectral component generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wave_echo_2d(sim_time_s, rng):
+def _generate_jonswap(rng):
     """
-    Return polar array (N_BEARINGS × N_RANGE_BINS) of wave backscatter.
-
-    Physics: η(r, θ, t) = Σ Aᵢ · clip(cos(−2π/λᵢ · r·cos(θ−dirᵢ) − 2π/Tᵢ · t), 0)²
-    Only wave crests (positive surface elevation) produce strong backscatter.
+    Sample N_JONSWAP_COMP wave components from a JONSWAP + von Mises distribution.
+    Returns a dict of float32 arrays: k, omega, dir, amp, phase, lambda_, period.
     """
-    bearings = np.linspace(0, 2 * np.pi, N_BEARINGS, endpoint=False)
-    r        = np.arange(N_RANGE_BINS, dtype=np.float32)
+    g        = 9.81
+    k_peak   = 2 * np.pi / PEAK_LAMBDA_M
+    om_peak  = np.sqrt(g * k_peak)           # deep-water: ω² = gk
 
-    wave = np.zeros((N_BEARINGS, N_RANGE_BINS), dtype=np.float32)
-    for w in WAVE_PARAMS:
-        k    = 2 * np.pi / w['λ']
-        om   = 2 * np.pi / w['T']
-        orig = np.radians(w['dir'])
-        # Projection: -r·cos(bearing − origin)  →  crests approach radar
-        cos_fac = -np.cos(bearings - orig)          # (N_BEARINGS,)
-        phase   = k * r[np.newaxis, :] * cos_fac[:, np.newaxis] - om * sim_time_s
-        crest   = np.clip(np.cos(phase).astype(np.float32), 0, None) ** 2
-        wave   += w['amp'] * crest
+    # Log-spaced frequencies with small random jitter
+    omegas = np.exp(np.linspace(np.log(0.48 * om_peak),
+                                np.log(2.90 * om_peak), N_JONSWAP_COMP))
+    omegas += rng.uniform(-0.015 * om_peak, 0.015 * om_peak, N_JONSWAP_COMP)
+    omegas  = np.clip(omegas, 0.3 * om_peak, 3.5 * om_peak)
 
-    # Add sea clutter (Rayleigh speckle, range-decaying)
-    r_decay  = np.exp(-r / 120).astype(np.float32)
-    speckle  = rng.rayleigh(1.0, (N_BEARINGS, N_RANGE_BINS)).astype(np.float32)
-    clutter  = SEA_CLUTTER * r_decay[np.newaxis, :] * speckle
+    # JONSWAP S(ω)
+    sigma = np.where(omegas <= om_peak, 0.07, 0.09)
+    r_exp = np.exp(-0.5 * ((omegas / om_peak - 1) / sigma) ** 2)
+    S     = (0.0081 * g**2 / omegas**5
+             * np.exp(-1.25 * (om_peak / omegas)**4)
+             * JONSWAP_GAMMA**r_exp)
 
-    data = wave + clutter + rng.normal(0, 0.02, wave.shape).astype(np.float32)
-    peak = np.percentile(data, 99.0)
-    return np.clip(data / (peak + 1e-9), 0, 1)
+    # Directional spreading (von Mises around peak direction)
+    dir_mean = np.radians(PEAK_DIR_DEG)
+    if dir_mean > np.pi:
+        dir_mean -= 2 * np.pi                # von Mises wants mean in (-π, π]
+    dirs = rng.vonmises(dir_mean, DIR_SPREAD_KAPPA, N_JONSWAP_COMP)
+
+    # Amplitude a_i = sqrt(2 S_i Δω)
+    dw   = np.gradient(omegas)
+    amps = np.sqrt(2.0 * S * np.abs(dw))
+    norm = np.percentile(amps, 95) * 3.2 + 1e-12
+    amps = (amps / norm).astype(np.float32)
+
+    # Deep-water dispersion: k = ω²/g
+    ks      = (omegas**2 / g).astype(np.float32)
+    periods = (2 * np.pi / omegas).astype(np.float32)
+    phases  = rng.uniform(0, 2 * np.pi, N_JONSWAP_COMP).astype(np.float32)
+
+    return {
+        'k':       ks,
+        'omega':   omegas.astype(np.float32),
+        'dir':     dirs.astype(np.float32),
+        'amp':     amps,
+        'phase':   phases,
+        'lambda_': (2 * np.pi / ks),
+        'period':  periods,
+    }
 
 
-def _wave_profile_1d(polar_data, bearing_deg):
-    """Extract 1D range profile at given bearing. Returns (N_RANGE_BINS,) array."""
-    b_idx = int(bearing_deg / 360 * N_BEARINGS) % N_BEARINGS
-    # Average ±2 bearing bins for smoother profile
-    indices = [(b_idx + d) % N_BEARINGS for d in range(-2, 3)]
-    return polar_data[indices, :].mean(axis=0)
+def _stokes_drift(comp):
+    """
+    Surface Stokes drift vector (Ux, Uy) in m/s.
+    U_S = Σ aᵢ² ωᵢ · (kx_i, ky_i)  where waves propagate TO (dir_i + π).
+    """
+    travel = comp['dir'] + np.pi
+    kx = comp['k'] * np.sin(travel)
+    ky = comp['k'] * np.cos(travel)
+    w  = comp['amp']**2 * comp['omega']
+    return float(np.sum(w * kx)), float(np.sum(w * ky))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Peak detection  (pure numpy — no scipy)
+# Radar backscatter simulation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _smooth(x, w=7):
-    kernel = np.ones(w) / w
-    return np.convolve(x, kernel, mode='same')
+def _wave_echo_2d(sim_time_s, comp, rng):
+    """
+    Polar array (N_BEARINGS × N_RANGE_BINS) of wave backscatter with:
+      • Multi-component JONSWAP surface elevation
+      • Grazing-angle shadow model (crests occlude troughs behind them)
+      • Rayleigh speckle × crest²  (non-sinusoidal, patchy texture)
+    """
+    bearings = np.linspace(0, 2 * np.pi, N_BEARINGS, endpoint=False,
+                           dtype=np.float32)
+    r_m      = (np.arange(N_RANGE_BINS, dtype=np.float32)) * RANGE_RES_M
+
+    # ── Surface elevation η(bearing, range) ────────────────────────────────
+    eta = np.zeros((N_BEARINGS, N_RANGE_BINS), dtype=np.float32)
+    for i in range(N_JONSWAP_COMP):
+        k   = float(comp['k'][i])
+        om  = float(comp['omega'][i])
+        d   = float(comp['dir'][i])        # FROM direction
+        amp = float(comp['amp'][i])
+        phi = float(comp['phase'][i])
+        # Projection: waves come FROM d, so phase increases toward radar
+        cos_fac = np.cos(bearings - d)                            # (N_B,)
+        phase   = (k * (-cos_fac[:, np.newaxis]) * r_m[np.newaxis, :]
+                   - om * sim_time_s + phi)                        # (N_B, N_R)
+        eta    += amp * np.cos(phase)
+
+    # ── Shadow model (grazing-angle occlusion) ─────────────────────────────
+    r_safe     = r_m + RANGE_RES_M                                # avoid /0
+    elev_angle = (eta + RADAR_HEIGHT_M) / r_safe[np.newaxis, :]   # (N_B, N_R)
+    run_max    = np.maximum.accumulate(elev_angle, axis=1)
+    prev_max   = np.concatenate(
+        [np.full((N_BEARINGS, 1), -np.inf, np.float32), run_max[:, :-1]], axis=1
+    )
+    visible = (elev_angle >= prev_max).astype(np.float32)
+
+    # ── Crest-only backscatter ──────────────────────────────────────────────
+    crest  = np.clip(eta, 0.0, None) ** 2
+    signal = crest * visible
+
+    # ── Rayleigh speckle + range-decaying clutter ──────────────────────────
+    speckle = rng.rayleigh(1.0, (N_BEARINGS, N_RANGE_BINS)).astype(np.float32)
+    r_decay = np.exp(-r_m / (MAX_RANGE_M * 0.75)).astype(np.float32)
+    clutter = SEA_CLUTTER * r_decay[np.newaxis, :] * speckle
+
+    # Multiplicative speckle modulates signal (irregular, patchy)
+    data = signal * (0.55 + 0.45 * speckle) + clutter
+    p99  = np.percentile(data, 99.3)
+    return np.clip(data / (p99 + 1e-9), 0.0, 1.0)
 
 
-def find_wave_peaks(profile, min_height=0.25):
-    """
-    Detect wave crests in a 1-D range profile.
-    Returns array of bin indices where peaks occur.
-    min_distance is auto-set to 60% of the dominant wavelength.
-    """
-    s     = _smooth(profile, w=5)
-    min_d = max(4, int(DOMINANT_WAVE['λ'] * 0.6 / RANGE_RES_M))
+# ─────────────────────────────────────────────────────────────────────────────
+# 2-D wavenumber spectrum
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_2d_spectrum(comp):
+    N      = 128
+    k_lim  = 4.5 * 2 * np.pi / PEAK_LAMBDA_M
+    kx_ax  = np.linspace(-k_lim, k_lim, N)
+    ky_ax  = np.linspace(-k_lim, k_lim, N)
+    KX, KY = np.meshgrid(kx_ax, ky_ax)
+    spec   = np.zeros((N, N), dtype=np.float32)
+    sigma_k = k_lim / 18.0
+
+    travel = comp['dir'] + np.pi
+    kxs    = comp['k'] * np.sin(travel)
+    kys    = comp['k'] * np.cos(travel)
+
+    for i in range(N_JONSWAP_COMP):
+        power = float(comp['amp'][i]**2)
+        blob  = np.exp(-((KX - kxs[i])**2 + (KY - kys[i])**2)
+                       / (2 * sigma_k**2)).astype(np.float32)
+        spec += power * blob
+
+    spec /= spec.max() + 1e-9
+    return spec, kx_ax, ky_ax
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Peak detection (no scipy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _smooth(x, w=9):
+    return np.convolve(x, np.ones(w) / w, mode='same')
+
+
+def find_wave_peaks(profile, min_height=0.18):
+    s     = _smooth(profile, w=7)
+    min_d = max(4, int(PEAK_LAMBDA_M * 0.50 / RANGE_RES_M))
     peaks = []
     for i in range(1, len(s) - 1):
         if s[i] > s[i - 1] and s[i] >= s[i + 1] and s[i] >= min_height:
@@ -161,74 +255,20 @@ def find_wave_peaks(profile, min_height=0.25):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Wave statistics
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _wave_stats(peaks, temporal_trace):
-    """
-    Return dict of wave statistics from peak positions and temporal data.
-    """
-    stats = {}
-
-    # Wavelength from spatial peak spacing
-    if len(peaks) >= 2:
-        spacings = np.diff(peaks) * RANGE_RES_M
-        stats['lambda_m']    = float(np.median(spacings))
-        stats['wave_count']  = len(peaks)
-    else:
-        stats['lambda_m']    = DOMINANT_WAVE['λ']
-        stats['wave_count']  = len(peaks)
-
-    # Theoretical period from deep-water dispersion: T = 2π√(λ/2πg)
-    g = 9.81
-    lam = stats['lambda_m']
-    stats['period_s_theory'] = 2 * np.pi * np.sqrt(lam / (2 * np.pi * g))
-
-    # Phase speed
-    stats['celerity_ms'] = lam / stats['period_s_theory']
-
-    # Measured period from temporal trace (count zero-crossings of mean-removed signal)
-    if len(temporal_trace) > 10:
-        tr    = np.array(temporal_trace)
-        tr_dm = tr - tr.mean()
-        zc    = np.where(np.diff(np.sign(tr_dm)))[0]
-        if len(zc) >= 2:
-            avg_half_period_revs = np.mean(np.diff(zc))
-            period_revs          = 2 * avg_half_period_revs
-            stats['period_revs'] = float(period_revs)
-            stats['period_s_meas'] = period_revs * PERIOD_S * SIM_SPEED
-        else:
-            stats['period_revs']   = stats['period_s_theory'] / (PERIOD_S * SIM_SPEED)
-            stats['period_s_meas'] = stats['period_s_theory']
-    else:
-        stats['period_revs']   = stats['period_s_theory'] / (PERIOD_S * SIM_SPEED)
-        stats['period_s_meas'] = stats['period_s_theory']
-
-    stats['swh_estimate'] = f'~{SEA_CLUTTER * 5:.1f}–{SEA_CLUTTER * 8:.1f} m'
-
-    return stats
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Simulator state
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WaveSimulator:
-    PERSIST = 0.992
+    PERSIST = 0.991
 
     def __init__(self):
-        self.rng          = np.random.default_rng(7)
+        self.rng          = np.random.default_rng(42)
         self.sim_time     = 0.0
         self.polar        = np.zeros((N_BEARINGS, N_RANGE_BINS), np.float32)
-        self.scan         = _wave_echo_2d(self.sim_time, self.rng)
+        self.components   = _generate_jonswap(self.rng)
+        self.scan         = _wave_echo_2d(self.sim_time, self.components, self.rng)
         self.bearing_step = 0
         self.rev_count    = 0
-
-        self.waterfall    = deque(maxlen=N_HISTORY_REVS)
-        self.temporal     = deque(maxlen=N_TRACE_REVS)
-        self.monitor_bin  = int(MONITOR_RANGE_M / RANGE_RES_M)
-
-    # ── Advance one animation frame ────────────────────────────────────────
 
     def step(self, steps=6):
         self.polar *= self.PERSIST
@@ -239,40 +279,117 @@ class WaveSimulator:
                 self._on_revolution()
 
     def _on_revolution(self):
-        self.sim_time += PERIOD_S * SIM_SPEED
+        self.sim_time  += PERIOD_S * SIM_SPEED
         self.rev_count += 1
-        self.scan = _wave_echo_2d(self.sim_time, self.rng)
-
-        # Record wave profile for waterfall
-        profile = _wave_profile_1d(self.scan, MONITOR_BEARING)
-        self.waterfall.append(profile.copy())
-
-        # Record amplitude at monitoring range for temporal trace
-        self.temporal.append(float(profile[self.monitor_bin]))
-
-    # ── Accessors ──────────────────────────────────────────────────────────
+        # Slowly evolve the wave field (sea state changes over minutes)
+        if self.rev_count % 25 == 0:
+            new_comp = _generate_jonswap(self.rng)
+            alpha = 0.08
+            for key in ('amp', 'phase', 'dir'):
+                self.components[key] = (
+                    (1 - alpha) * self.components[key] + alpha * new_comp[key]
+                ).astype(np.float32)
+        self.scan = _wave_echo_2d(self.sim_time, self.components, self.rng)
 
     @property
     def bearing_deg(self):
         return self.bearing_step / N_BEARINGS * 360.0
 
     def ppi_image(self):
-        img = self.polar[_BIDX, _RIDX].copy()
-        img[_MASK] = 0
+        img = self.polar[_PBIDX, _PRIDX].copy()
+        img[_LAND] = 0.0
         return img
 
-    def current_profile(self):
-        return _wave_profile_1d(self.polar, MONITOR_BEARING)
+    def profile_along(self, bearing_deg):
+        b    = int(bearing_deg / 360 * N_BEARINGS) % N_BEARINGS
+        idxs = [(b + d) % N_BEARINGS for d in range(-2, 3)]
+        return self.polar[idxs, :].mean(axis=0)
 
-    def waterfall_image(self):
-        if len(self.waterfall) < 2:
-            return np.zeros((N_HISTORY_REVS, N_RANGE_BINS))
-        mat = np.array(self.waterfall)
-        # Pad top if not full yet
-        if mat.shape[0] < N_HISTORY_REVS:
-            pad = np.zeros((N_HISTORY_REVS - mat.shape[0], N_RANGE_BINS))
-            mat = np.vstack([pad, mat])
-        return mat
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _draw_static_ppi(ax):
+    """Range rings, cardinal labels, shore, wave boxes — drawn once."""
+    # Range rings (top-half arcs only)
+    for r_nm in np.arange(0.5, RANGE_NM + 0.01, 0.5):
+        r_m   = r_nm * METERS_PER_NM
+        b_arc = np.linspace(-np.pi / 2, np.pi / 2, 200)
+        ax.plot(r_m * np.sin(b_arc), r_m * np.cos(b_arc),
+                color='#182818', lw=0.55, ls='--', zorder=1)
+        ax.text(0, r_m * 1.015, f'{r_m:.0f} m',
+                color='#284028', fontsize=6, ha='center', va='bottom', zorder=8)
+
+    # Bearing spokes every 30°
+    for b_deg in range(-90, 91, 30):
+        b_rad = np.radians(b_deg)
+        ax.plot([0, MAX_RANGE_M * np.sin(b_rad)],
+                [0, MAX_RANGE_M * np.cos(b_rad)],
+                color='#182818', lw=0.4, ls=':', zorder=1)
+        if b_deg != 0:
+            ax.text(MAX_RANGE_M * 1.03 * np.sin(b_rad),
+                    MAX_RANGE_M * 1.03 * np.cos(b_rad),
+                    f'{b_deg % 360}°',
+                    color='#3a5a3a', fontsize=6, ha='center', va='center')
+
+    # Cardinal labels
+    for lbl, bx, by in [('N', 0, 1.07), ('NE', 0.76, 0.76),
+                         ('NW', -0.76, 0.76), ('E', 1.07, 0), ('W', -1.07, 0)]:
+        ax.text(bx * MAX_RANGE_M, by * MAX_RANGE_M,
+                lbl, color='#50a050', fontsize=8, fontweight='bold',
+                ha='center', va='center', zorder=9)
+
+    # Shore line + land fill
+    land = mpatches.Rectangle(
+        (-MAX_RANGE_M * 1.10, -MAX_RANGE_M * 1.10),
+        MAX_RANGE_M * 2.20, MAX_RANGE_M * 1.10,
+        fc='#18130a', ec='none', zorder=5,
+    )
+    ax.add_patch(land)
+    ax.plot([-MAX_RANGE_M * 1.05, MAX_RANGE_M * 1.05], [0, 0],
+            color='#b89050', lw=2.2, zorder=6)
+    ax.text(-MAX_RANGE_M * 0.92, -MAX_RANGE_M * 0.07,
+            'SHORE  ←  LAND', color='#b89050', fontsize=7.5, zorder=7)
+
+    # Wave-analysis boxes
+    for box in WAVE_BOXES:
+        r1, r2 = box['r']
+        b_c    = box['b']
+        w_d    = box['w']
+        col    = box['color']
+        ang    = np.linspace(np.radians(b_c - w_d/2),
+                             np.radians(b_c + w_d/2), 40)
+        ox, oy = r2 * np.sin(ang), r2 * np.cos(ang)
+        ix, iy = r1 * np.sin(ang[::-1]), r1 * np.cos(ang[::-1])
+        px, py = np.concatenate([ox, ix]), np.concatenate([oy, iy])
+        ax.fill(px, py, color=col, alpha=0.10, zorder=3)
+        ax.plot(np.append(px, px[0]), np.append(py, py[0]),
+                color=col, lw=1.0, alpha=0.65, zorder=4)
+        bm = np.radians(b_c)
+        ax.text(r2 * 1.05 * np.sin(bm), r2 * 1.05 * np.cos(bm),
+                box['label'], color=col, fontsize=6.5,
+                ha='center', va='center', zorder=8)
+
+
+def _make_drift_arrows(ax, n_x=8, n_y=4):
+    """
+    Create a uniform grid of annotation arrows for Stokes drift.
+    Returns list of (annotation, base_x, base_y).
+    """
+    xs = np.linspace(-MAX_RANGE_M * 0.78, MAX_RANGE_M * 0.78, n_x)
+    ys = np.linspace(MAX_RANGE_M * 0.14,  MAX_RANGE_M * 0.85, n_y)
+    arrows = []
+    for ay in ys:
+        for arx in xs:
+            ann = ax.annotate(
+                '', xy=(arx, ay), xytext=(arx, ay),
+                arrowprops=dict(arrowstyle='->', color='#00ccff',
+                                lw=1.2, mutation_scale=7),
+                zorder=12, annotation_clip=False,
+            )
+            arrows.append((ann, arx, ay))
+    return arrows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,62 +397,32 @@ class WaveSimulator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_display(sim):
-    fig = plt.figure(figsize=(15, 9), facecolor='#060810')
-    fig.canvas.manager.set_window_title('Wave Monitoring — Radar Backscatter Analysis')
-
-    gs = fig.add_gridspec(
-        3, 3,
-        left=0.05, right=0.98, top=0.93, bottom=0.06,
-        wspace=0.32, hspace=0.45,
-        width_ratios=[1.1, 1.4, 1.0],
-        height_ratios=[1.3, 1.0, 1.0],
+    fig = plt.figure(figsize=(16, 9), facecolor='#050810')
+    fig.canvas.manager.set_window_title(
+        'Wave Monitoring — Shore-based Radar  (180° seaward view)'
     )
 
-    ax_ppi    = fig.add_subplot(gs[0:2, 0], facecolor='black')   # PPI (tall)
-    ax_prof   = fig.add_subplot(gs[0, 1:], facecolor='#060810')  # Wave profile
-    ax_temp   = fig.add_subplot(gs[1, 1],  facecolor='#060810')  # Temporal trace
-    ax_stats  = fig.add_subplot(gs[1, 2],  facecolor='#060810')  # Statistics
-    ax_water  = fig.add_subplot(gs[2, :],  facecolor='#060810')  # Waterfall
+    gs = fig.add_gridspec(
+        2, 2,
+        left=0.02, right=0.97, top=0.93, bottom=0.05,
+        wspace=0.26, hspace=0.40,
+        width_ratios=[1.45, 1.0],
+        height_ratios=[1.0, 1.0],
+    )
 
-    # ── PPI static ────────────────────────────────────────────────────────────
+    ax_ppi  = fig.add_subplot(gs[:, 0], facecolor='black')    # left — full height
+    ax_prof = fig.add_subplot(gs[0, 1], facecolor='#04060e')  # upper right
+    ax_spec = fig.add_subplot(gs[1, 1], facecolor='#04060e')  # lower right
+
+    # ── PPI ───────────────────────────────────────────────────────────────────
     ax_ppi.set_aspect('equal')
-    ax_ppi.set_xlim(-MAX_RANGE_M, MAX_RANGE_M)
-    ax_ppi.set_ylim(-MAX_RANGE_M, MAX_RANGE_M)
+    ax_ppi.set_xlim(-MAX_RANGE_M * 1.10, MAX_RANGE_M * 1.10)
+    ax_ppi.set_ylim(-MAX_RANGE_M * 0.17, MAX_RANGE_M * 1.10)
     ax_ppi.axis('off')
-    ax_ppi.set_title('PPI  —  Sea Surface', color='#70e070', fontsize=8, pad=4)
+    ax_ppi.set_title('Shore-based radar  —  seaward 180°  (JONSWAP + shadow + speckle)',
+                     color='#70e070', fontsize=8.5, pad=4)
 
-    for r_nm in np.arange(0.5, RANGE_NM + 0.01, 0.5):
-        ax_ppi.add_patch(plt.Circle((0, 0), r_nm * METERS_PER_NM,
-                                    color='#182818', lw=0.6, fill=False, ls='--'))
-    ax_ppi.add_patch(plt.Circle((0, 0), MAX_RANGE_M,
-                                color='#2a4a2a', lw=1.2, fill=False))
-    for lbl, bx, by in [('N', 0, 1), ('E', 1, 0), ('S', 0, -1), ('W', -1, 0)]:
-        ax_ppi.text(bx * MAX_RANGE_M * 1.10, by * MAX_RANGE_M * 1.10,
-                    lbl, color='#50a050', fontsize=8, fontweight='bold',
-                    ha='center', va='center')
-
-    # Wave sector wedge  (shows the monitoring bearing)
-    sector_half = 20
-    b_lo = np.radians(MONITOR_BEARING - sector_half)
-    b_hi = np.radians(MONITOR_BEARING + sector_half)
-    angles = np.linspace(b_lo, b_hi, 60)
-    sx = np.concatenate([[0], MAX_RANGE_M * np.sin(angles), [0]])
-    sy = np.concatenate([[0], MAX_RANGE_M * np.cos(angles), [0]])
-    ax_ppi.fill(sx, sy, color='#003366', alpha=0.22, zorder=1)
-    ax_ppi.plot([0, MAX_RANGE_M * np.sin(np.radians(MONITOR_BEARING))],
-                [0, MAX_RANGE_M * np.cos(np.radians(MONITOR_BEARING))],
-                color='#4080ff', lw=0.8, ls='--', alpha=0.6, zorder=2)
-    ax_ppi.text(MAX_RANGE_M * 0.55 * np.sin(np.radians(MONITOR_BEARING + 12)),
-                MAX_RANGE_M * 0.55 * np.cos(np.radians(MONITOR_BEARING + 12)),
-                'WAVE\nSECTOR', color='#4080ff', fontsize=6.5, ha='center')
-
-    # Monitoring range circle
-    ax_ppi.add_patch(plt.Circle((0, 0), MONITOR_RANGE_M,
-                                color='#ff8040', lw=0.8, fill=False,
-                                linestyle=':', alpha=0.7))
-    ax_ppi.text(MONITOR_RANGE_M * np.sin(np.radians(55)),
-                MONITOR_RANGE_M * np.cos(np.radians(55)),
-                f'{MONITOR_RANGE_M} m', color='#ff8040', fontsize=6)
+    _draw_static_ppi(ax_ppi)
 
     ppi_img = ax_ppi.imshow(
         np.zeros((PPI_SIZE, PPI_SIZE), np.float32),
@@ -343,146 +430,96 @@ def build_display(sim):
         extent=[-MAX_RANGE_M, MAX_RANGE_M, -MAX_RANGE_M, MAX_RANGE_M],
         interpolation='bilinear', zorder=0,
     )
-    sweep_ln, = ax_ppi.plot([], [], color='#80ff80', lw=1.1, alpha=0.9, zorder=3)
+
+    sweep_ln, = ax_ppi.plot([], [], color='#90ff90', lw=1.0, alpha=0.85, zorder=13)
+
+    drift_arrows = _make_drift_arrows(ax_ppi)
+    drift_lbl = ax_ppi.text(
+        -MAX_RANGE_M * 1.03, MAX_RANGE_M * 0.95,
+        'Stokes drift', color='#00ccff', fontsize=7.5,
+        fontweight='bold', va='top', zorder=14,
+    )
 
     # ── Wave profile ──────────────────────────────────────────────────────────
-    ax_prof.set_facecolor('#04060e')
     ax_prof.set_xlim(0, MAX_RANGE_M)
-    ax_prof.set_ylim(-0.05, 1.15)
+    ax_prof.set_ylim(-0.05, 1.22)
     ax_prof.set_xlabel('Range (m)', color='#5080a0', fontsize=8)
     ax_prof.set_ylabel('Backscatter amplitude', color='#5080a0', fontsize=8)
-    ax_prof.set_title(f'Wave Profile  —  bearing {MONITOR_BEARING:.0f}°  (wave origin direction)',
+    ax_prof.set_title(f'Wave Profile  —  bearing {PEAK_DIR_DEG:.0f}°  '
+                      f'(wave origin direction)',
                       color='#80b0d0', fontsize=8, pad=3)
     ax_prof.tick_params(colors='#304060', labelsize=7)
     ax_prof.spines[:].set_color('#1a2a3a')
-    ax_prof.axhline(0, color='#1a2a3a', lw=0.5)
-    ax_prof.axhline(0.25, color='#1a2a3a', lw=0.4, ls=':')   # detection threshold
+    ax_prof.axhline(0.18, color='#1a2a3a', lw=0.5, ls=':')   # detection threshold
 
-    prof_line,   = ax_prof.plot(RANGE_AXIS, np.zeros(N_RANGE_BINS),
-                                color='#60b0ff', lw=1.0, zorder=3)
-    prof_fill    = ax_prof.fill_between(RANGE_AXIS, 0,
-                                        np.zeros(N_RANGE_BINS),
-                                        color='#0030a0', alpha=0.3, zorder=2)
-    # Monitoring range vertical line
-    ax_prof.axvline(MONITOR_RANGE_M, color='#ff8040', lw=0.8, ls=':',
-                    alpha=0.7, label=f'Monitor point ({MONITOR_RANGE_M} m)')
-    ax_prof.legend(loc='upper right', fontsize=6.5,
-                   facecolor='#060810', edgecolor='#304060', labelcolor='#ff8040')
+    prof_line, = ax_prof.plot(RANGE_AXIS, np.zeros(N_RANGE_BINS),
+                              color='#60b0ff', lw=0.9)
+    prof_fill  = [None]
 
-    # Peak markers (max N_RANGE_BINS // 5 possible peaks)
-    max_peaks = 60
-    peak_lines  = [ax_prof.axvline(0, color='#ff4040', lw=0.9, ls='--',
-                                   alpha=0.0, zorder=4) for _ in range(max_peaks)]
-    peak_labels = [ax_prof.text(0, 1.02, '', color='#ff6060', fontsize=6,
-                                ha='center', rotation=90, va='bottom', zorder=5)
-                   for _ in range(max_peaks)]
+    max_pk = 60
+    pk_lines  = [ax_prof.axvline(0, color='#ff5555', lw=0.85, ls='--',
+                                 alpha=0.0) for _ in range(max_pk)]
+    pk_labels = [ax_prof.text(0, 1.08, '', color='#ff7777', fontsize=5.5,
+                              ha='center', rotation=90, va='bottom')
+                 for _ in range(max_pk)]
+    lam_txt  = ax_prof.text(0.98, 0.94, '', transform=ax_prof.transAxes,
+                            color='#ffff80', fontsize=9, fontweight='bold',
+                            ha='right', va='top')
+    cnt_txt  = ax_prof.text(0.98, 0.82, '', transform=ax_prof.transAxes,
+                            color='#ffffa0', fontsize=9, fontweight='bold',
+                            ha='right', va='top')
 
-    # Wavelength annotation (a double-headed arrow between peak 0 and peak 1)
-    wave_annot = ax_prof.annotate(
-        '', xy=(0, 0.85), xytext=(0, 0.85),
-        arrowprops=dict(arrowstyle='<->', color='#ffff60', lw=1.0),
-    )
-    lambda_label = ax_prof.text(0, 0.90, '', color='#ffff60', fontsize=7,
-                                ha='center', fontweight='bold')
-
-    wave_count_txt = ax_prof.text(
-        0.98, 0.95, '', transform=ax_prof.transAxes,
-        color='#ffffa0', fontsize=9, fontweight='bold',
-        ha='right', va='top',
-    )
-
-    # ── Temporal trace ────────────────────────────────────────────────────────
-    ax_temp.set_facecolor('#04060e')
-    ax_temp.set_xlim(0, N_TRACE_REVS)
-    ax_temp.set_ylim(-0.05, 1.15)
-    ax_temp.set_xlabel('Antenna revolutions', color='#5080a0', fontsize=8)
-    ax_temp.set_ylabel('Amplitude', color='#5080a0', fontsize=8)
-    ax_temp.set_title(f'Temporal Trace  @  {MONITOR_RANGE_M} m  ·  {MONITOR_BEARING:.0f}°',
+    # ── 2-D wavenumber spectrum ───────────────────────────────────────────────
+    ax_spec.set_aspect('equal')
+    ax_spec.set_title('2D Wavenumber Spectrum  (k-space)',
                       color='#80b0d0', fontsize=8, pad=3)
-    ax_temp.tick_params(colors='#304060', labelsize=7)
-    ax_temp.spines[:].set_color('#1a2a3a')
-    ax_temp.axhline(0, color='#1a2a3a', lw=0.5)
+    ax_spec.set_xlabel('kₓ  (rad/m)  →  East', color='#5080a0', fontsize=7.5)
+    ax_spec.set_ylabel('k_y  (rad/m)  →  North', color='#5080a0', fontsize=7.5)
+    ax_spec.tick_params(colors='#304060', labelsize=7)
+    ax_spec.spines[:].set_color('#1a2a3a')
+    ax_spec.axhline(0, color='#222244', lw=0.5)
+    ax_spec.axvline(0, color='#222244', lw=0.5)
 
-    temp_line, = ax_temp.plot([], [], color='#40e0c0', lw=1.0)
-    temp_fill  = [None]   # mutable placeholder (fill_between can't be updated directly)
-    period_txt = ax_temp.text(0.02, 0.92, '', transform=ax_temp.transAxes,
-                              color='#ffffa0', fontsize=8, va='top')
-
-    # ── Statistics panel ──────────────────────────────────────────────────────
-    ax_stats.set_facecolor('#04060e')
-    ax_stats.axis('off')
-    ax_stats.set_title('Wave Statistics', color='#80b0d0', fontsize=8, pad=3)
-    stats_text = ax_stats.text(
-        0.05, 0.95, 'Initialising…',
-        transform=ax_stats.transAxes,
-        color='#c0d8f0', fontsize=8.5, va='top', family='monospace',
-        linespacing=1.8,
-    )
-
-    # ── Waterfall ─────────────────────────────────────────────────────────────
-    ax_water.set_facecolor('#04060e')
-    ax_water.set_title(
-        f'Range–Time Waterfall  —  bearing {MONITOR_BEARING:.0f}°  '
-        f'(diagonal bands = wave propagation toward radar)',
-        color='#80b0d0', fontsize=8, pad=3,
-    )
-    ax_water.set_xlabel('Range (m)', color='#5080a0', fontsize=8)
-    ax_water.set_ylabel('Time  (revolutions, newest→top)',
-                        color='#5080a0', fontsize=8)
-    ax_water.tick_params(colors='#304060', labelsize=7)
-    ax_water.spines[:].set_color('#1a2a3a')
-
-    water_img = ax_water.imshow(
-        np.zeros((N_HISTORY_REVS, N_RANGE_BINS)),
-        cmap=WATER_CMAP, vmin=0, vmax=1, origin='lower',
+    spec_data, kx_ax, ky_ax = _compute_2d_spectrum(sim.components)
+    spec_img = ax_spec.imshow(
+        spec_data, cmap=SPEC_CMAP, vmin=0, vmax=1, origin='lower',
         aspect='auto',
-        extent=[0, MAX_RANGE_M, 0, N_HISTORY_REVS],
-        interpolation='nearest',
+        extent=[kx_ax[0], kx_ax[-1], ky_ax[0], ky_ax[-1]],
+        interpolation='bilinear',
     )
-    ax_water.set_xlim(0, MAX_RANGE_M)
-    ax_water.set_ylim(0, N_HISTORY_REVS)
 
-    # Monitoring range line on waterfall
-    ax_water.axvline(MONITOR_RANGE_M, color='#ff8040', lw=0.9, ls=':',
-                     alpha=0.7, label=f'{MONITOR_RANGE_M} m monitor')
-    ax_water.legend(loc='upper right', fontsize=6.5,
-                    facecolor='#060810', edgecolor='#304060', labelcolor='#ff8040')
-
-    # Propagation speed annotation on waterfall (updated each frame)
-    prop_annot = ax_water.annotate(
-        '', xy=(0, 0), xytext=(0, 0),
-        arrowprops=dict(arrowstyle='->', color='#ffff80', lw=1.2),
-        annotation_clip=False,
-    )
-    prop_label = ax_water.text(0, 0, '', color='#ffff80', fontsize=7)
+    # Peak wavenumber ring annotation
+    k_p    = 2 * np.pi / PEAK_LAMBDA_M
+    c_ang  = np.linspace(0, 2 * np.pi, 120)
+    ax_spec.plot(k_p * np.cos(c_ang), k_p * np.sin(c_ang),
+                 color='#ffffff', lw=0.55, ls=':', alpha=0.45)
+    ax_spec.text(k_p * 1.08, 0, f'λ={PEAK_LAMBDA_M}m',
+                 color='#7788aa', fontsize=6, va='center')
 
     # ── Figure title ──────────────────────────────────────────────────────────
     fig.text(
-        0.5, 0.975,
+        0.50, 0.975,
         f'WAVE MONITORING  ·  Furuno FAR-2xx8 / PCI-9812  ·  '
-        f'{SAMPLE_RATE_HZ/1e6:.0f} MS/s  ·  {RANGE_NM:.0f} NM  ·  '
-        f'Primary swell λ={DOMINANT_WAVE["λ"]} m  from {DOMINANT_WAVE["dir"]:.0f}°',
+        f'{SAMPLE_RATE_HZ/1e6:.0f} MS/s  ·  {RANGE_NM:.1f} NM  ·  '
+        f'JONSWAP  λ_p={PEAK_LAMBDA_M} m  from {PEAK_DIR_DEG}° (NW)  ·  '
+        f'{N_JONSWAP_COMP} components',
         color='#90d090', fontsize=8.5, ha='center', fontweight='bold',
     )
 
     artists = dict(
         ppi_img=ppi_img, sweep_ln=sweep_ln,
+        drift_arrows=drift_arrows, drift_lbl=drift_lbl,
         prof_line=prof_line, prof_fill=prof_fill,
-        peak_lines=peak_lines, peak_labels=peak_labels,
-        wave_annot=wave_annot, lambda_label=lambda_label,
-        wave_count_txt=wave_count_txt,
-        temp_line=temp_line, temp_fill=temp_fill,
-        period_txt=period_txt,
-        stats_text=stats_text,
-        water_img=water_img,
-        prop_annot=prop_annot, prop_label=prop_label,
-        ax_prof=ax_prof, ax_temp=ax_temp, ax_water=ax_water,
+        pk_lines=pk_lines, pk_labels=pk_labels,
+        lam_txt=lam_txt, cnt_txt=cnt_txt,
+        spec_img=spec_img,
+        ax_prof=ax_prof, ax_spec=ax_spec,
     )
     return fig, artists
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Animation update
+# Animation updater
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_updater(sim, arts):
@@ -493,142 +530,71 @@ def make_updater(sim, arts):
         fc = frame_ctr[0]
         frame_ctr[0] += 1
 
-        # ── PPI ──────────────────────────────────────────────────────────────
+        # ── PPI + sweep line (every frame) ───────────────────────────────────
         arts['ppi_img'].set_data(sim.ppi_image())
-        b_rad = np.radians(sim.bearing_deg)
-        arts['sweep_ln'].set_data(
-            [0, MAX_RANGE_M * 0.97 * np.sin(b_rad)],
-            [0, MAX_RANGE_M * 0.97 * np.cos(b_rad)],
-        )
+        b_deg = sim.bearing_deg
+        if b_deg <= 90 or b_deg >= 270:            # sea sector only
+            b_rad = np.radians(b_deg)
+            arts['sweep_ln'].set_data(
+                [0, MAX_RANGE_M * 0.97 * np.sin(b_rad)],
+                [0, MAX_RANGE_M * 0.97 * np.cos(b_rad)],
+            )
+        else:
+            arts['sweep_ln'].set_data([], [])
 
         # Heavy updates every 4 frames
         if fc % 4 != 0:
             return
 
-        # ── Wave profile ─────────────────────────────────────────────────────
-        profile = sim.current_profile()
+        # ── Stokes drift arrows ───────────────────────────────────────────────
+        Ux, Uy = _stokes_drift(sim.components)
+        mag    = np.sqrt(Ux**2 + Uy**2) + 1e-12
+        scale  = MAX_RANGE_M * 0.09
+        dx     = Ux / mag * scale
+        dy     = Uy / mag * scale
+        for ann, arx, ary in arts['drift_arrows']:
+            ann.xy     = (arx + dx, ary + dy)
+            ann.xytext = (arx, ary)
+        arts['drift_lbl'].set_text(
+            f'Stokes drift  {mag:.4f} m/s\n'
+            f'→  {np.degrees(np.arctan2(Ux, Uy)) % 360:.0f}°'
+        )
+
+        # ── Wave profile ──────────────────────────────────────────────────────
+        profile = sim.profile_along(PEAK_DIR_DEG)
         arts['prof_line'].set_ydata(profile)
 
-        # Update fill (must remove old and redraw)
-        if arts['prof_fill']:
+        if arts['prof_fill'][0] is not None:
             try:
-                arts['prof_fill'].remove()
+                arts['prof_fill'][0].remove()
             except Exception:
                 pass
-        arts['prof_fill'] = arts['ax_prof'].fill_between(
-            RANGE_AXIS, 0, profile, color='#0030a0', alpha=0.25, zorder=2
+        arts['prof_fill'][0] = arts['ax_prof'].fill_between(
+            RANGE_AXIS, 0, profile, color='#002880', alpha=0.28
         )
 
-        # Peak detection
         peaks = find_wave_peaks(profile)
-
-        # Hide all peak markers first
-        for ln in arts['peak_lines']:
+        for ln in arts['pk_lines']:
             ln.set_alpha(0.0)
-        for lb in arts['peak_labels']:
+        for lb in arts['pk_labels']:
             lb.set_text('')
+        for i, pk in enumerate(peaks[:len(arts['pk_lines'])]):
+            rm = RANGE_AXIS[pk]
+            arts['pk_lines'][i].set_xdata([rm, rm])
+            arts['pk_lines'][i].set_alpha(0.60)
+            arts['pk_labels'][i].set_position((rm, 1.09))
+            arts['pk_labels'][i].set_text(f'{rm:.0f}m')
 
-        # Show detected peaks
-        for i, pk in enumerate(peaks[:len(arts['peak_lines'])]):
-            r_m = RANGE_AXIS[pk]
-            arts['peak_lines'][i].set_xdata([r_m, r_m])
-            arts['peak_lines'][i].set_alpha(0.70)
-            arts['peak_labels'][i].set_position((r_m, 1.03))
-            arts['peak_labels'][i].set_text(f'W{i+1}\n{r_m:.0f}m')
-
-        # Wavelength double-arrow between first two peaks
         if len(peaks) >= 2:
-            r0 = RANGE_AXIS[peaks[0]]
-            r1 = RANGE_AXIS[peaks[1]]
-            lam_meas = r1 - r0
-            arts['wave_annot'].xy     = (r1, 0.82)
-            arts['wave_annot'].xytext = (r0, 0.82)
-            arts['wave_annot'].get_figure()   # keep ref alive
-            arts['lambda_label'].set_position(((r0 + r1) / 2, 0.87))
-            arts['lambda_label'].set_text(f'λ ≈ {lam_meas:.0f} m')
+            lam_m = RANGE_AXIS[peaks[1]] - RANGE_AXIS[peaks[0]]
+            arts['lam_txt'].set_text(f'λ ≈ {lam_m:.0f} m')
         else:
-            arts['lambda_label'].set_text('')
+            arts['lam_txt'].set_text('')
+        arts['cnt_txt'].set_text(f'{len(peaks)} waves')
 
-        arts['wave_count_txt'].set_text(
-            f'{len(peaks)} waves\nin view'
-        )
-
-        # ── Temporal trace ────────────────────────────────────────────────────
-        trace = np.array(sim.temporal)
-        if len(trace) > 1:
-            x_vals = np.arange(len(trace))
-            arts['temp_line'].set_data(x_vals, trace)
-            arts['ax_temp'].set_xlim(0, max(N_TRACE_REVS, len(trace)))
-
-            if arts['temp_fill'][0] is not None:
-                try:
-                    arts['temp_fill'][0].remove()
-                except Exception:
-                    pass
-            arts['temp_fill'][0] = arts['ax_temp'].fill_between(
-                x_vals, 0, trace, color='#006050', alpha=0.35
-            )
-
-            # Estimate period from zero-crossings of mean-removed trace
-            mean_val = float(trace.mean())
-            dm = trace - mean_val
-            zc = np.where(np.diff(np.sign(dm)))[0]
-            if len(zc) >= 4:
-                half_periods = np.diff(zc)
-                avg_period   = float(np.mean(half_periods)) * 2
-                t_sim_period = avg_period * PERIOD_S * SIM_SPEED
-                arts['period_txt'].set_text(
-                    f'Tₘₑₐₛ ≈ {t_sim_period:.1f} s / rev  '
-                    f'({avg_period:.1f} rev cycle)'
-                )
-            else:
-                arts['period_txt'].set_text(f'Accumulating data…  ({len(trace)} revs)')
-
-        # ── Waterfall ─────────────────────────────────────────────────────────
-        wf = sim.waterfall_image()
-        arts['water_img'].set_data(wf)
-
-        # Draw propagation speed arrow on waterfall
-        # Speed: c = λ/T, in bins per revolution = c / RANGE_RES_M × PERIOD_S × SIM_SPEED
-        stats = _wave_stats(peaks, sim.temporal)
-        c     = stats['celerity_ms']
-        bins_per_rev = c / RANGE_RES_M * PERIOD_S * SIM_SPEED
-        # Arrow from (start_range, bottom) to (start_range - bins_per_rev * n_revs, top)
-        r_start = MAX_RANGE_M * 0.65 / RANGE_RES_M * RANGE_RES_M  # midpoint range
-        n_arrow = min(20, N_HISTORY_REVS - 2)
-        r_end   = r_start - bins_per_rev * RANGE_RES_M * n_arrow
-        if r_end > 0:
-            arts['prop_annot'].xy     = (r_end,   N_HISTORY_REVS - 2)
-            arts['prop_annot'].xytext = (r_start, N_HISTORY_REVS - 2 - n_arrow)
-            arts['prop_label'].set_position(
-                ((r_start + r_end) / 2, N_HISTORY_REVS - 2 - n_arrow / 2)
-            )
-            arts['prop_label'].set_text(f'{c:.1f} m/s')
-
-        # ── Statistics panel ──────────────────────────────────────────────────
-        lam = stats['lambda_m']
-        T_t = stats['period_s_theory']
-        T_m = stats['period_s_meas']
-        n_w = stats['wave_count']
-        c   = stats['celerity_ms']
-        txt = (
-            f"  Waves in view    :  {n_w}\n"
-            f"\n"
-            f"  Wavelength  (λ)  :  {lam:>7.1f} m\n"
-            f"  Phase speed (c)  :  {c:>7.2f} m/s\n"
-            f"\n"
-            f"  Period — theory  :  {T_t:>7.2f} s\n"
-            f"  Period — radar   :  {T_m:>7.2f} s\n"
-            f"\n"
-            f"  Wave origin      :  {DOMINANT_WAVE['dir']:.0f}°  (NW)\n"
-            f"  Sea state        :  Bft {int(SEA_CLUTTER*27):d}\n"
-            f"  SWH estimate     :  {stats['swh_estimate']}\n"
-            f"\n"
-            f"  Monitor range    :  {MONITOR_RANGE_M} m\n"
-            f"  Range res.       :  {RANGE_RES_M:.2f} m / bin\n"
-            f"  Sample rate      :  {SAMPLE_RATE_HZ/1e6:.0f} MS/s"
-        )
-        arts['stats_text'].set_text(txt)
+        # ── 2-D spectrum ──────────────────────────────────────────────────────
+        spec_data, _, _ = _compute_2d_spectrum(sim.components)
+        arts['spec_img'].set_data(spec_data)
 
     return update
 
@@ -638,24 +604,24 @@ def make_updater(sim, arts):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print('Wave Monitoring Simulator')
-    print(f'  Primary swell: λ={DOMINANT_WAVE["λ"]} m  T={DOMINANT_WAVE["T"]} s  '
-          f'from {DOMINANT_WAVE["dir"]}°')
-    print(f'  Range res: {RANGE_RES_M:.2f} m/bin  '
-          f'({N_RANGE_BINS} bins  =  {MAX_RANGE_M:.0f} m)')
-    print(f'  Sim speed: {SIM_SPEED}× real time per revolution')
+    print('Wave Monitoring  —  shore-based 180° radar view')
+    print(f'  Peak swell: λ={PEAK_LAMBDA_M} m  T≈{2*np.pi*np.sqrt(PEAK_LAMBDA_M/(2*np.pi*9.81)):.1f} s'
+          f'  from {PEAK_DIR_DEG}° (NW)')
+    print(f'  JONSWAP components: {N_JONSWAP_COMP}   γ={JONSWAP_GAMMA}')
+    print(f'  Range: {MAX_RANGE_M:.0f} m   Res: {RANGE_RES_M:.2f} m/bin   '
+          f'Bins: {N_RANGE_BINS}')
+    print(f'  Shadow model: radar height {RADAR_HEIGHT_M} m')
     print()
 
-    sim  = WaveSimulator()
-    # Pre-fill history with a few revolutions of data
-    print('  Building scan history…')
-    for _ in range(N_HISTORY_REVS):
+    sim = WaveSimulator()
+    print('  Pre-filling scan history…')
+    for _ in range(10):
         sim._on_revolution()
 
     fig, arts = build_display(sim)
     updater   = make_updater(sim, arts)
 
-    ani = animation.FuncAnimation(
+    ani = animation.FuncAnimation(             # noqa: F841
         fig, updater, interval=35, blit=False, cache_frame_data=False
     )
     plt.show()
