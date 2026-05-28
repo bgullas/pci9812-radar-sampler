@@ -24,43 +24,33 @@ if sys.platform != 'win32':
     raise EnvironmentError('This script must run on Windows (PCI-DASK.dll required)')
 
 
+_ADLINK_DIRS = [
+    os.path.dirname(os.path.abspath(__file__)),
+    r'C:\ADLINK\PCI-DASK',
+    r'C:\ADLINK\PCIS-DASK',
+    r'C:\Program Files\ADLINK\PCI-DASK',
+    r'C:\Program Files (x86)\ADLINK\PCI-DASK',
+    r'C:\Program Files\ADLINK\PCIS-DASK',
+    r'C:\Program Files (x86)\ADLINK\PCIS-DASK',
+    r'C:\Windows\System32',
+    r'C:\Windows\SysWOW64',
+]
+
+
 def _find_dask_dll():
-    """
-    Locate PCI-DASK.dll using the same search order Windows uses when
-    the C program loads it:
-      1. Directory containing this script  (same folder as your C project)
-      2. Common ADLINK driver install paths
-      3. System PATH / Windows default DLL search
-    """
+    """Locate PCI-Dask64.dll, searching the script folder first."""
     dll_name = 'PCI-Dask64.dll'
-
-    search_dirs = [
-        os.path.dirname(os.path.abspath(__file__)),          # script folder
-        r'C:\ADLINK\PCI-DASK',
-        r'C:\ADLINK\PCIS-DASK',
-        r'C:\Program Files\ADLINK\PCI-DASK',
-        r'C:\Program Files (x86)\ADLINK\PCI-DASK',
-        r'C:\Program Files\ADLINK\PCIS-DASK',
-        r'C:\Program Files (x86)\ADLINK\PCIS-DASK',
-        r'C:\Windows\System32',
-        r'C:\Windows\SysWOW64',
-    ]
-
-    for d in search_dirs:
+    for d in _ADLINK_DIRS:
         candidate = os.path.join(d, dll_name)
         if os.path.isfile(candidate):
             print(f'Found {dll_name} at: {candidate}')
-            # Python 3.8+: add the folder so its own dependencies resolve too
             if hasattr(os, 'add_dll_directory'):
                 os.add_dll_directory(d)
             return candidate
-
-    # Last resort: let ctypes search the system PATH
     found = ctypes.util.find_library('PCI-Dask64')
     if found:
         print(f'Found via system PATH: {found}')
         return found
-
     raise FileNotFoundError(
         f'{dll_name} not found.\n'
         'Copy PCI-Dask64.dll into the same folder as this script, or add its '
@@ -68,11 +58,36 @@ def _find_dask_dll():
     )
 
 
+def _read_constant_from_header(name):
+    """
+    Parse a #define value from dask.h.
+    Searches the same directories as the DLL so the value is always correct.
+    """
+    import re
+    pattern = re.compile(rf'^\s*#define\s+{re.escape(name)}\s+(\w+)', re.MULTILINE)
+    for d in _ADLINK_DIRS:
+        for subdir in ('', 'Include', 'include'):
+            header = os.path.join(d, subdir, 'dask.h')
+            if os.path.isfile(header):
+                text = open(header).read()
+                m = pattern.search(text)
+                if m:
+                    val = m.group(1)
+                    result = int(val, 16) if val.startswith('0x') or val.startswith('0X') else int(val)
+                    print(f'dask.h: {name} = {result}  (from {header})')
+                    return result
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Constants — from dask.h
+# Constants — read from dask.h where possible, fall back to known values
 # ---------------------------------------------------------------------------
 
-PCI_9812 = 17
+_PCI_9812_FROM_HEADER = _read_constant_from_header('PCI_9812')
+PCI_9812 = _PCI_9812_FROM_HEADER if _PCI_9812_FROM_HEADER is not None else 17
+if _PCI_9812_FROM_HEADER is None:
+    print(f'WARNING: dask.h not found — using PCI_9812={PCI_9812} (may be wrong). '
+          f'Check your ADLINK SDK Include folder.')
 
 AD_B_5_V  = 1   # Bipolar ±5 V
 AD_B_1_V  = 3   # Bipolar ±1 V
@@ -333,7 +348,7 @@ def plot_fft(ch_data, sample_rate):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    card_num    = 0             # <-- change this if you have multiple cards
+    card_num    = 0             # 0 for the first card; increment if you have multiple
     channel     = 3
     ad_range    = AD_B_5_V
     file_name   = '9812d'
