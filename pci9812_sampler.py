@@ -1,422 +1,315 @@
 """
 ADLINK PCI-9812 Radar Data Sampler
-Uses the PCIS-DASK driver DLL (Windows) via ctypes.
+Uses the ADLINK DASK driver (DASK.dll) on Windows.
 
-Hardware specs:
-  - 4 simultaneous analog input channels, 12-bit ADC
-  - Up to 20 MS/s sampling rate (40 MHz internal clock / divisor)
-  - Input voltage range: ±1V or ±5V (programmable)
-  - 32k-sample onboard FIFO, bus-mastering DMA transfer
+Translated from the working C reference program — identical API calls:
+  Register_Card → AI_9812_Config → AI_AsyncDblBufferMode
+  → AI_ContScanChannelsToFile → poll AI_AsyncDblBufferHalfReady
+  → AI_AsyncClear → Release_Card
 
-Driver: PCIS-DASK.dll  (install ADLINK PCIS-DASK driver package first)
+Requirements:
+  pip install numpy matplotlib
+  ADLINK DASK driver installed (provides DASK.dll)
 """
 
-import ctypes
 import sys
+import ctypes
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-if sys.platform != "win32":
-    raise RuntimeError(
-        "PCIS-DASK.dll is a Windows-only driver. "
-        "This script must run on a Windows machine with the ADLINK driver installed."
-    )
-
-# ---------------------------------------------------------------------------
-# PCIS-DASK constants
-# ---------------------------------------------------------------------------
-
-# Trigger modes
-TRIG_SOFTWARE   = 0
-TRIG_POST       = 1
-TRIG_PRE        = 2
-TRIG_MIDDLE     = 3
-TRIG_DELAY      = 4
-
-# Trigger sources
-TRIG_SRC_CH0    = 0   # Analog trigger from channel 0
-TRIG_SRC_CH1    = 1
-TRIG_SRC_CH2    = 2
-TRIG_SRC_CH3    = 3
-TRIG_SRC_EXT    = 4   # External digital trigger
-
-# Trigger slope
-TRIG_SLOPE_POS  = 0   # Rising edge
-TRIG_SLOPE_NEG  = 1   # Falling edge
-
-# Clock sources
-INT_CLK         = 0   # Internal 40 MHz clock
-SIN_CLK         = 1   # External sine wave clock
-SQR_CLK         = 2   # External square wave clock
-
-# Voltage ranges (for raw→voltage conversion)
-VRANGE_1V       = 1.0   # ±1V
-VRANGE_5V       = 5.0   # ±5V
-
-# DMA status flags
-DMA_DONE        = 0
-DMA_RUNNING     = 1
-
-# ADC resolution
-ADC_BITS        = 12
-ADC_COUNTS      = 2 ** ADC_BITS        # 4096
-ADC_MIDPOINT    = ADC_COUNTS // 2      # 2048 (zero-voltage point)
-
-# Internal clock frequency
-MASTER_CLK_HZ   = 40_000_000          # 40 MHz
+if sys.platform != 'win32':
+    raise EnvironmentError('This script must run on Windows (DASK.dll required)')
 
 
 # ---------------------------------------------------------------------------
-# Helper: compute clock divisor for a desired sample rate
+# Constants — from dask.h
 # ---------------------------------------------------------------------------
 
-def sample_rate_to_divisor(sample_rate_hz: int) -> int:
-    """
-    Sampling rate = MASTER_CLK_HZ / (divisor + 1)
-    Divisor must be in range [1, 65535].
-    """
-    divisor = round(MASTER_CLK_HZ / sample_rate_hz) - 1
-    divisor = max(1, min(divisor, 65535))
-    actual = MASTER_CLK_HZ / (divisor + 1)
-    if abs(actual - sample_rate_hz) / sample_rate_hz > 0.01:
-        print(f"[warn] Requested {sample_rate_hz/1e6:.3f} MS/s, "
-              f"actual will be {actual/1e6:.3f} MS/s (divisor={divisor})")
-    return divisor
+PCI_9812 = 17
 
+AD_B_5_V  = 1   # Bipolar ±5 V
+AD_B_1_V  = 3   # Bipolar ±1 V
 
-def raw_to_voltage(raw: np.ndarray, vrange: float = VRANGE_5V) -> np.ndarray:
-    """Convert 12-bit ADC raw values to volts."""
-    return ((raw.astype(np.float32) - ADC_MIDPOINT) / ADC_MIDPOINT) * vrange
+P9812_TRGMOD_SOFT = 0
+P9812_TRGMOD_POST = 1
+P9812_TRGMOD_PRE  = 2
+P9812_TRGMOD_MIDL = 3
+P9812_TRGMOD_DELY = 4
+
+P9812_TRGSRC_CH0  = 0
+P9812_TRGSRC_CH1  = 1
+P9812_TRGSRC_CH2  = 2
+P9812_TRGSRC_CH3  = 3
+P9812_TRGSRC_EXT  = 4
+
+P9812_TRGSLP_POS  = 0
+P9812_TRGSLP_NEG  = 1
+
+P9812_CLKSRC_INT  = 0x0000
+P9812_CLKSRC_SIN  = 0x0004
+P9812_CLKSRC_SQR  = 0x0008
+P9812_AD2_GT_PCI  = 0x0002
+
+SYNCH_OP   = 0
+ASYNCH_OP  = 1
+
+ADC_MID    = 2048   # 12-bit midpoint for voltage conversion
 
 
 # ---------------------------------------------------------------------------
-# PCI9812 driver wrapper
+# DASK DLL wrapper
 # ---------------------------------------------------------------------------
 
-class PCI9812:
-    """
-    Context-manager wrapper around the ADLINK PCIS-DASK Windows DLL.
+class DASK:
+    """ctypes wrapper around DASK.dll — mirrors the C API exactly."""
 
-    Usage:
-        with PCI9812(card_no=0) as daq:
-            data = daq.acquire(
-                channels=[0, 1, 2, 3],
-                samples_per_channel=8192,
-                sample_rate_hz=10_000_000,
-            )
-    """
+    DLL_NAME = 'DASK.dll'
 
-    DLL_NAME = "PCIS-DASK.dll"
-
-    def __init__(self, card_no: int = 0, vrange: float = VRANGE_5V):
-        self.card_no  = card_no
-        self.vrange   = vrange
-        self._dll     = None
-        self._dma_buf = None   # ctypes array allocated for DMA
-        self._open    = False
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def open(self):
-        """Load DLL and initialise the card."""
+    def __init__(self):
         try:
-            self._dll = ctypes.CDLL(self.DLL_NAME)
+            self._dll = ctypes.windll.LoadLibrary(self.DLL_NAME)
         except OSError as exc:
             raise RuntimeError(
-                f"Cannot load {self.DLL_NAME}. "
-                "Ensure the ADLINK PCIS-DASK driver is installed."
+                f'Cannot load {self.DLL_NAME}. '
+                'Install the ADLINK DASK driver package.'
             ) from exc
+        self._set_prototypes()
 
-        self._configure_prototypes()
-
-        op_base = ctypes.c_uint16(0)
-        pt_base = ctypes.c_uint16(0)
-        irq_no  = ctypes.c_uint16(0)
-        pci_master = ctypes.c_uint16(0)
-
-        ret = self._dll.W_9812_Initial(
-            self.card_no,
-            ctypes.byref(op_base),
-            ctypes.byref(pt_base),
-            ctypes.byref(irq_no),
-            ctypes.byref(pci_master),
+    def Register_Card(self, card_type, card_num):
+        handle = self._dll.Register_Card(
+            ctypes.c_uint16(card_type),
+            ctypes.c_uint16(card_num),
         )
-        self._check(ret, "W_9812_Initial")
-        self._open = True
-        print(f"[PCI-9812] card {self.card_no} opened  "
-              f"(base=0x{op_base.value:04X}, IRQ={irq_no.value}, "
-              f"master={pci_master.value})")
+        if handle < 0:
+            raise RuntimeError(f'Register_Card error={handle}')
+        return handle
 
-    def close(self):
-        if self._dma_buf is not None:
-            self._dll.W_9812_Free_DMA_Mem(ctypes.byref(self._dma_buf))
-            self._dma_buf = None
-        if self._open and self._dll is not None:
-            self._dll.W_9812_Close(self.card_no)
-            self._open = False
-            print(f"[PCI-9812] card {self.card_no} closed")
-
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-    # ------------------------------------------------------------------
-    # Configuration helpers
-    # ------------------------------------------------------------------
-
-    def set_clock(self, sample_rate_hz: int, clk_src: int = INT_CLK):
-        divisor = sample_rate_to_divisor(sample_rate_hz)
-        ret = self._dll.W_9812_Set_Clk_Rate(
-            self.card_no, clk_src, 0, ctypes.c_uint16(divisor)
+    def AI_9812_Config(self, card, trig_mod, trig_src, trig_slp,
+                       ad_timing, trig_level, post_count):
+        err = self._dll.AI_9812_Config(
+            ctypes.c_int16(card),
+            ctypes.c_uint16(trig_mod),
+            ctypes.c_uint16(trig_src),
+            ctypes.c_uint16(trig_slp),
+            ctypes.c_uint16(ad_timing),
+            ctypes.c_uint16(trig_level),
+            ctypes.c_uint32(post_count),
         )
-        self._check(ret, "W_9812_Set_Clk_Rate")
-        actual = MASTER_CLK_HZ / (divisor + 1)
-        print(f"[PCI-9812] sample rate set to {actual/1e6:.3f} MS/s "
-              f"(divisor={divisor})")
-        return actual
+        self._check(err, 'AI_9812_Config')
 
-    def set_trigger(
-        self,
-        mode:  int   = TRIG_SOFTWARE,
-        src:   int   = TRIG_SRC_EXT,
-        slope: int   = TRIG_SLOPE_POS,
-        level: int   = 0,
-        post_samples: int = 0,
-    ):
-        """
-        level     : trigger level as raw ADC count (0–4095), ignored for
-                    software/external triggers.
-        post_samples : number of samples to collect after trigger (post/delay
-                    trigger modes). Pass total_samples for post-trigger mode.
-        """
-        ret = self._dll.W_9812_Set_Trig(
-            self.card_no,
-            mode,
-            src,
-            slope,
-            ctypes.c_uint16(level),
-            ctypes.c_uint16(post_samples),
+    def AI_AsyncDblBufferMode(self, card, enable):
+        err = self._dll.AI_AsyncDblBufferMode(
+            ctypes.c_int16(card),
+            ctypes.c_uint16(1 if enable else 0),
         )
-        self._check(ret, "W_9812_Set_Trig")
+        self._check(err, 'AI_AsyncDblBufferMode')
 
-    # ------------------------------------------------------------------
-    # DMA acquisition
-    # ------------------------------------------------------------------
-
-    def acquire(
-        self,
-        channels: list[int],
-        samples_per_channel: int,
-        sample_rate_hz: int = 10_000_000,
-        trigger_mode: int = TRIG_SOFTWARE,
-        timeout_s: float = 5.0,
-    ) -> dict[int, np.ndarray]:
-        """
-        Acquire data from the specified channels.
-
-        Returns a dict  {channel_index: voltage_array}  where each array
-        contains `samples_per_channel` float32 voltage values.
-
-        channels            : list of channel indices, e.g. [0, 1, 2, 3]
-        samples_per_channel : number of samples per channel
-        sample_rate_hz      : desired aggregate sampling rate
-        trigger_mode        : one of TRIG_SOFTWARE, TRIG_POST, etc.
-        timeout_s           : maximum wait time for DMA completion
-        """
-        if not self._open:
-            raise RuntimeError("Card not opened. Call open() first.")
-
-        n_ch     = len(channels)
-        total_samples = samples_per_channel * n_ch  # interleaved in DMA buf
-
-        # --- Channel enable bitmask (bits 0-3) ---
-        ch_mask = 0
-        for ch in channels:
-            if ch not in range(4):
-                raise ValueError(f"Invalid channel {ch}. Must be 0–3.")
-            ch_mask |= (1 << ch)
-
-        # --- Configure clock ---
-        actual_rate = self.set_clock(sample_rate_hz)
-
-        # --- Configure trigger ---
-        self.set_trigger(
-            mode=trigger_mode,
-            post_samples=samples_per_channel,
+    def AI_ContScanChannelsToFile(self, card, channel, ad_range,
+                                   file_name, count, sample_rate, synch):
+        if isinstance(file_name, str):
+            file_name = file_name.encode('ascii')
+        err = self._dll.AI_ContScanChannelsToFile(
+            ctypes.c_int16(card),
+            ctypes.c_uint16(channel),
+            ctypes.c_uint16(ad_range),
+            ctypes.c_char_p(file_name),
+            ctypes.c_uint32(count),
+            ctypes.c_double(sample_rate),
+            ctypes.c_uint16(synch),
         )
+        self._check(err, 'AI_ContScanChannelsToFile')
 
-        # --- Allocate DMA buffer ---
-        buf_size = total_samples * ctypes.sizeof(ctypes.c_uint16)
-        DMABuf = ctypes.c_uint16 * total_samples
-        dma_buf = DMABuf()
-
-        ret = self._dll.W_9812_Alloc_DMA_Mem(
-            self.card_no,
-            buf_size,
-            ctypes.byref(dma_buf),
+    def AI_AsyncDblBufferHalfReady(self, card):
+        half_ready = ctypes.c_uint16(0)
+        f_stop     = ctypes.c_uint16(0)
+        self._dll.AI_AsyncDblBufferHalfReady(
+            ctypes.c_int16(card),
+            ctypes.byref(half_ready),
+            ctypes.byref(f_stop),
         )
-        self._check(ret, "W_9812_Alloc_DMA_Mem")
-        self._dma_buf = dma_buf
+        return bool(half_ready.value), bool(f_stop.value)
 
-        # --- Start DMA acquisition ---
-        ret = self._dll.W_9812_AD_DMA_Start(
-            self.card_no,
-            ctypes.c_uint16(ch_mask),
-            total_samples,
-            ctypes.byref(dma_buf),
+    def AI_AsyncDblBufferTransfer(self, card, buf=None):
+        ptr = ctypes.cast(buf, ctypes.c_void_p) if buf is not None else None
+        self._dll.AI_AsyncDblBufferTransfer(ctypes.c_int16(card), ptr)
+
+    def AI_AsyncClear(self, card):
+        count = ctypes.c_uint32(0)
+        err   = self._dll.AI_AsyncClear(
+            ctypes.c_int16(card), ctypes.byref(count)
         )
-        self._check(ret, "W_9812_AD_DMA_Start")
-        print(f"[PCI-9812] DMA started — {n_ch} ch × {samples_per_channel} "
-              f"samples @ {actual_rate/1e6:.3f} MS/s")
+        self._check(err, 'AI_AsyncClear')
+        return count.value
 
-        # --- Poll for completion ---
-        status   = ctypes.c_uint16(DMA_RUNNING)
-        deadline = time.monotonic() + timeout_s
-        while True:
-            ret = self._dll.W_9812_AD_DMA_Status(
-                self.card_no, ctypes.byref(status)
-            )
-            self._check(ret, "W_9812_AD_DMA_Status")
-            if status.value == DMA_DONE:
-                break
-            if time.monotonic() > deadline:
-                self._dll.W_9812_AD_DMA_Stop(self.card_no)
-                raise TimeoutError(
-                    f"DMA acquisition timed out after {timeout_s}s"
-                )
-            time.sleep(0.001)
+    def Release_Card(self, card):
+        err = self._dll.Release_Card(ctypes.c_int16(card))
+        self._check(err, 'Release_Card')
 
-        print("[PCI-9812] DMA complete — converting samples")
-
-        # --- Extract and de-interleave channels ---
-        raw_all = np.frombuffer(dma_buf, dtype=np.uint16).copy()
-
-        result = {}
-        for idx, ch in enumerate(channels):
-            raw_ch = raw_all[idx::n_ch][:samples_per_channel]
-            result[ch] = raw_to_voltage(raw_ch, self.vrange)
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _configure_prototypes(self):
-        """Set ctypes argtypes/restype for each DLL function."""
-        dll = self._dll
+    def _set_prototypes(self):
+        d   = self._dll
+        I16 = ctypes.c_int16
         U16 = ctypes.c_uint16
-        PU16 = ctypes.POINTER(U16)
-        INT = ctypes.c_int
+        U32 = ctypes.c_uint32
+        F64 = ctypes.c_double
 
-        dll.W_9812_Initial.argtypes = [INT, PU16, PU16, PU16, PU16]
-        dll.W_9812_Initial.restype  = INT
-
-        dll.W_9812_Close.argtypes  = [INT]
-        dll.W_9812_Close.restype   = INT
-
-        dll.W_9812_Set_Clk_Rate.argtypes = [INT, INT, INT, U16]
-        dll.W_9812_Set_Clk_Rate.restype  = INT
-
-        dll.W_9812_Set_Trig.argtypes = [INT, INT, INT, INT, U16, U16]
-        dll.W_9812_Set_Trig.restype  = INT
-
-        dll.W_9812_Alloc_DMA_Mem.argtypes = [INT, INT, ctypes.c_void_p]
-        dll.W_9812_Alloc_DMA_Mem.restype  = INT
-
-        dll.W_9812_Free_DMA_Mem.argtypes  = [ctypes.c_void_p]
-        dll.W_9812_Free_DMA_Mem.restype   = INT
-
-        dll.W_9812_AD_DMA_Start.argtypes = [INT, U16, INT, ctypes.c_void_p]
-        dll.W_9812_AD_DMA_Start.restype  = INT
-
-        dll.W_9812_AD_DMA_Status.argtypes = [INT, PU16]
-        dll.W_9812_AD_DMA_Status.restype  = INT
-
-        dll.W_9812_AD_DMA_Stop.argtypes = [INT]
-        dll.W_9812_AD_DMA_Stop.restype  = INT
+        d.Register_Card.argtypes              = [U16, U16]
+        d.Register_Card.restype               = I16
+        d.AI_9812_Config.argtypes             = [I16, U16, U16, U16, U16, U16, U32]
+        d.AI_9812_Config.restype              = I16
+        d.AI_AsyncDblBufferMode.argtypes      = [I16, U16]
+        d.AI_AsyncDblBufferMode.restype       = I16
+        d.AI_ContScanChannelsToFile.argtypes  = [I16, U16, U16, ctypes.c_char_p, U32, F64, U16]
+        d.AI_ContScanChannelsToFile.restype   = I16
+        d.AI_AsyncDblBufferHalfReady.argtypes = [I16, ctypes.POINTER(U16), ctypes.POINTER(U16)]
+        d.AI_AsyncDblBufferHalfReady.restype  = I16
+        d.AI_AsyncDblBufferTransfer.argtypes  = [I16, ctypes.c_void_p]
+        d.AI_AsyncDblBufferTransfer.restype   = I16
+        d.AI_AsyncClear.argtypes              = [I16, ctypes.POINTER(U32)]
+        d.AI_AsyncClear.restype               = I16
+        d.Release_Card.argtypes               = [I16]
+        d.Release_Card.restype                = I16
 
     @staticmethod
-    def _check(ret: int, fname: str):
-        if ret != 0:
-            raise RuntimeError(f"{fname} failed with error code {ret:#06x}")
+    def _check(err, fname):
+        if err != 0:
+            raise RuntimeError(f'{fname} error={err}')
 
 
 # ---------------------------------------------------------------------------
-# Plot helper
+# Acquisition — identical logic to the C program
 # ---------------------------------------------------------------------------
 
-def plot_channels(
-    data: dict[int, np.ndarray],
-    sample_rate_hz: float,
-    vrange: float = VRANGE_5V,
-    title: str = "PCI-9812 Radar Acquisition",
-):
-    n_ch = len(data)
-    fig, axes = plt.subplots(n_ch, 1, figsize=(12, 3 * n_ch), sharex=True)
-    if n_ch == 1:
+def acquire(channel, ad_range, file_name, read_count, sample_rate,
+            card_num=0, duration_s=5.0):
+    """
+    Acquire radar data to file, then return a dict of voltage arrays.
+
+    channel     : last channel index (e.g. 3 → scans CH0–CH3)
+    ad_range    : AD_B_5_V or AD_B_1_V
+    file_name   : output base name (driver appends .dat)
+    read_count  : circular buffer size in samples
+    sample_rate : samples/second per channel
+    duration_s  : how long to run (replaces kbhit() from C)
+    """
+    n_ch   = channel + 1
+    vrange = 5.0 if ad_range == AD_B_5_V else 1.0
+
+    print(f'PCI-9812  CH0–CH{channel}  {sample_rate:.0f} S/s  '
+          f'buffer={read_count}  → {file_name}.dat')
+
+    dask = DASK()
+    card = dask.Register_Card(PCI_9812, card_num)
+
+    dask.AI_9812_Config(
+        card,
+        trig_mod   = P9812_TRGMOD_SOFT,
+        trig_src   = P9812_TRGSRC_CH0,
+        trig_slp   = P9812_TRGSLP_POS,
+        ad_timing  = P9812_AD2_GT_PCI | P9812_CLKSRC_INT,
+        trig_level = 0x80,
+        post_count = 0,
+    )
+    dask.AI_AsyncDblBufferMode(card, enable=True)
+    dask.AI_ContScanChannelsToFile(
+        card, channel, ad_range, file_name,
+        read_count, sample_rate, ASYNCH_OP,
+    )
+
+    count      = 0
+    half_count = read_count // 2
+    deadline   = time.monotonic() + duration_s
+
+    print(f'Acquiring for {duration_s}s …')
+    while time.monotonic() < deadline:
+        half_ready, f_stop = dask.AI_AsyncDblBufferHalfReady(card)
+        if half_ready:
+            dask.AI_AsyncDblBufferTransfer(card, buf=None)
+            count += half_count
+            print(f'\r{count} samples', end='', flush=True)
+        if f_stop:
+            break
+
+    total = dask.AI_AsyncClear(card)
+    dask.Release_Card(card)
+    print(f'\n{count} samples written to {file_name}.dat  (total={total})')
+
+    # Read back and convert to volts
+    raw    = np.fromfile(f'{file_name}.dat', dtype=np.int16)
+    result = {}
+    for ch in range(n_ch):
+        raw_ch     = raw[ch::n_ch].astype(np.float32)
+        result[ch] = (raw_ch - ADC_MID) / ADC_MID * vrange
+    return result, sample_rate
+
+
+# ---------------------------------------------------------------------------
+# Plot helpers
+# ---------------------------------------------------------------------------
+
+def plot_time(ch_data, sample_rate, vrange, title='PCI-9812 Radar'):
+    n = len(ch_data)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3 * n), sharex=True)
+    if n == 1:
         axes = [axes]
-
-    for ax, (ch, volts) in zip(axes, sorted(data.items())):
-        t_us = np.arange(len(volts)) / sample_rate_hz * 1e6
-        ax.plot(t_us, volts, linewidth=0.6)
-        ax.set_ylabel(f"CH{ch} (V)")
+    for ch, ax in enumerate(axes):
+        t = np.arange(len(ch_data[ch])) / sample_rate * 1e3
+        ax.plot(t, ch_data[ch], lw=0.6)
+        ax.set_ylabel(f'CH{ch} (V)')
         ax.set_ylim(-vrange * 1.05, vrange * 1.05)
-        ax.axhline(0, color="gray", linewidth=0.4, linestyle="--")
+        ax.axhline(0, color='gray', lw=0.4, ls='--')
         ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Time (µs)")
+    axes[-1].set_xlabel('Time (ms)')
     fig.suptitle(title, fontsize=13)
     plt.tight_layout()
     plt.show()
 
 
+def plot_fft(ch_data, sample_rate):
+    n = len(ch_data)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ch, ax in enumerate(axes):
+        v   = ch_data[ch]
+        N   = len(v)
+        win = np.hanning(N)
+        sp  = np.abs(np.fft.rfft(v * win)) * 2 / N
+        f   = np.fft.rfftfreq(N, d=1.0 / sample_rate) / 1e3
+        ax.plot(f, 20 * np.log10(sp + 1e-9), lw=0.6)
+        ax.set_ylabel(f'CH{ch} (dBV)')
+        ax.set_ylim(-100, 10)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel('Frequency (kHz)')
+    fig.suptitle('Frequency Spectrum  |  Hanning window', fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------------------------
-# Main — edit parameters here
+# Entry point — matches the C program parameters exactly
 # ---------------------------------------------------------------------------
 
-def main():
-    CARD_NO           = 0               # First installed PCI-9812
-    CHANNELS          = [0, 1, 2, 3]   # All 4 channels
-    SAMPLES_PER_CH    = 8192            # Samples per channel (≤ 8k for 4-ch @ 20MS/s)
-    SAMPLE_RATE_HZ    = 10_000_000      # 10 MS/s  (max 20 MS/s)
-    VOLTAGE_RANGE     = VRANGE_5V       # ±5V  (or VRANGE_1V for ±1V)
-    TRIGGER           = TRIG_SOFTWARE   # Change to TRIG_POST for hardware trigger
+if __name__ == '__main__':
+    channel     = 3
+    ad_range    = AD_B_5_V
+    file_name   = '9812d'
+    read_count  = 4000
+    sample_rate = 20000.0
+    duration_s  = 5.0
 
-    print("=" * 60)
-    print("ADLINK PCI-9812  |  PCIS-DASK driver")
-    print("=" * 60)
+    card_num = int(input('Please input a card number: '))
 
-    with PCI9812(card_no=CARD_NO, vrange=VOLTAGE_RANGE) as daq:
-        data = daq.acquire(
-            channels=CHANNELS,
-            samples_per_channel=SAMPLES_PER_CH,
-            sample_rate_hz=SAMPLE_RATE_HZ,
-            trigger_mode=TRIGGER,
-            timeout_s=5.0,
-        )
+    ch_data, sr = acquire(
+        channel, ad_range, file_name, read_count, sample_rate,
+        card_num=card_num, duration_s=duration_s,
+    )
 
-    # Print quick stats per channel
-    print("\nChannel statistics:")
-    for ch, v in sorted(data.items()):
-        print(f"  CH{ch}: min={v.min():.4f} V  max={v.max():.4f} V  "
-              f"mean={v.mean():.4f} V  rms={np.sqrt(np.mean(v**2)):.4f} V")
+    vrange = 5.0 if ad_range == AD_B_5_V else 1.0
+    print('\nChannel statistics:')
+    for ch, v in ch_data.items():
+        print(f'  CH{ch}: min={v.min():.4f} V  max={v.max():.4f} V  '
+              f'rms={np.sqrt(np.mean(v**2)):.4f} V')
 
-    # Save raw numpy data
-    out_file = "pci9812_data.npz"
-    np.savez(out_file, **{f"ch{ch}": v for ch, v in data.items()},
-             sample_rate_hz=np.float64(SAMPLE_RATE_HZ))
-    print(f"\nData saved to {out_file}")
-
-    # Plot
-    plot_channels(data, SAMPLE_RATE_HZ, vrange=VOLTAGE_RANGE)
-
-
-if __name__ == "__main__":
-    main()
+    plot_time(ch_data, sr, vrange)
+    plot_fft(ch_data, sr)
