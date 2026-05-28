@@ -32,7 +32,7 @@ def _find_dask_dll():
       2. Common ADLINK driver install paths
       3. System PATH / Windows default DLL search
     """
-    dll_name = 'PCI-DASK.dll'
+    dll_name = 'PCI-Dask64.dll'
 
     search_dirs = [
         os.path.dirname(os.path.abspath(__file__)),          # script folder
@@ -56,14 +56,14 @@ def _find_dask_dll():
             return candidate
 
     # Last resort: let ctypes search the system PATH
-    found = ctypes.util.find_library('PCI-DASK')
+    found = ctypes.util.find_library('PCI-Dask64')
     if found:
         print(f'Found via system PATH: {found}')
         return found
 
     raise FileNotFoundError(
         f'{dll_name} not found.\n'
-        'Copy PCI-DASK.dll into the same folder as this script, or add its '
+        'Copy PCI-Dask64.dll into the same folder as this script, or add its '
         'location to the Windows PATH environment variable.'
     )
 
