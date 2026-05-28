@@ -1,6 +1,6 @@
 """
 ADLINK PCI-9812 Radar Data Sampler
-Uses the ADLINK DASK driver (DASK.dll) on Windows.
+Uses the ADLINK PCIS-DASK driver (PCI-DASK.dll) on Windows.
 
 Translated from the working C reference program — identical API calls:
   Register_Card → AI_9812_Config → AI_AsyncDblBufferMode
@@ -9,17 +9,63 @@ Translated from the working C reference program — identical API calls:
 
 Requirements:
   pip install numpy matplotlib
-  ADLINK DASK driver installed (provides DASK.dll)
+  ADLINK PCIS-DASK driver installed (provides PCI-DASK.dll)
 """
 
+import os
 import sys
 import ctypes
+import ctypes.util
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 
 if sys.platform != 'win32':
-    raise EnvironmentError('This script must run on Windows (DASK.dll required)')
+    raise EnvironmentError('This script must run on Windows (PCI-DASK.dll required)')
+
+
+def _find_dask_dll():
+    """
+    Locate PCI-DASK.dll using the same search order Windows uses when
+    the C program loads it:
+      1. Directory containing this script  (same folder as your C project)
+      2. Common ADLINK driver install paths
+      3. System PATH / Windows default DLL search
+    """
+    dll_name = 'PCI-DASK.dll'
+
+    search_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),          # script folder
+        r'C:\ADLINK\PCI-DASK',
+        r'C:\ADLINK\PCIS-DASK',
+        r'C:\Program Files\ADLINK\PCI-DASK',
+        r'C:\Program Files (x86)\ADLINK\PCI-DASK',
+        r'C:\Program Files\ADLINK\PCIS-DASK',
+        r'C:\Program Files (x86)\ADLINK\PCIS-DASK',
+        r'C:\Windows\System32',
+        r'C:\Windows\SysWOW64',
+    ]
+
+    for d in search_dirs:
+        candidate = os.path.join(d, dll_name)
+        if os.path.isfile(candidate):
+            print(f'Found {dll_name} at: {candidate}')
+            # Python 3.8+: add the folder so its own dependencies resolve too
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(d)
+            return candidate
+
+    # Last resort: let ctypes search the system PATH
+    found = ctypes.util.find_library('PCI-DASK')
+    if found:
+        print(f'Found via system PATH: {found}')
+        return found
+
+    raise FileNotFoundError(
+        f'{dll_name} not found.\n'
+        'Copy PCI-DASK.dll into the same folder as this script, or add its '
+        'location to the Windows PATH environment variable.'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -62,18 +108,14 @@ ADC_MID    = 2048   # 12-bit midpoint for voltage conversion
 # ---------------------------------------------------------------------------
 
 class DASK:
-    """ctypes wrapper around DASK.dll — mirrors the C API exactly."""
-
-    DLL_NAME = 'PCI-DASK.dll'
+    """ctypes wrapper around PCI-DASK.dll — mirrors the C API exactly."""
 
     def __init__(self):
+        dll_path = _find_dask_dll()
         try:
-            self._dll = ctypes.windll.LoadLibrary(self.DLL_NAME)
+            self._dll = ctypes.WinDLL(dll_path)
         except OSError as exc:
-            raise RuntimeError(
-                f'Cannot load {self.DLL_NAME}. '
-                'Install the ADLINK DASK driver package.'
-            ) from exc
+            raise RuntimeError(f'Failed to load DLL: {dll_path}') from exc
         self._set_prototypes()
 
     def Register_Card(self, card_type, card_num):
