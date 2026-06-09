@@ -339,20 +339,26 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
 # ---------------------------------------------------------------------------
 # Radar channel roles (Furuno FAR-2xx8, port J510)
 # ---------------------------------------------------------------------------
-# CH0 — VIDEO  : radar echo video,  4 Vp-p coax → ÷6 divider → ~0.67 Vp-p
-# CH1 — TRIG   : range trigger pulse, 0-12 V → ÷12 divider → ~1 V, 5-15 µs wide
-# CH2 — BP     : bearing pulse, 0-12 V → ÷12 divider → ~1 V, one pulse per 0.18°
-# CH3 — HD     : heading pulse, 0-12 V → ÷12 divider → ~1 V, one pulse per revolution
+# CH0 — HD     : heading pulse,      0-12 V → ÷12 divider → ~1 V, 1 pulse/revolution
+# CH1 — BP     : bearing pulse,      0-12 V → ÷12 divider → ~1 V, 1 pulse per 0.18°
+# CH2 — TRIG   : range trigger pulse,0-12 V → ÷12 divider → ~1 V, 5-15 µs wide
+# CH3 — VIDEO  : radar echo video,   4 Vp-p coax → voltage divider → ~0.67 Vp-p
 #
-# All digital lines (TRIG / BP / HD) pass through an 11 kΩ / 1 kΩ voltage
+# All digital lines (HD / BP / TRIG) pass through an 11 kΩ / 1 kΩ voltage
 # divider before the card input to step 12 V down to ≈ 1 V.
 
 CH_LABELS = {
-    0: 'VIDEO  (radar echo)',
-    1: 'TRIG   (range trigger)',
-    2: 'BP     (bearing pulse)',
-    3: 'HD     (heading / north)',
+    0: 'HD     (heading / north)',
+    1: 'BP     (bearing pulse)',
+    2: 'TRIG   (range trigger)',
+    3: 'VIDEO  (radar echo)',
 }
+
+# Channel index aliases — use these everywhere instead of bare numbers
+CH_HD    = 0
+CH_BP    = 1
+CH_TRIG  = 2
+CH_VIDEO = 3
 
 # ---------------------------------------------------------------------------
 # Trigger-pulse detection (CH1 — TRIG)
@@ -360,7 +366,7 @@ CH_LABELS = {
 
 def detect_triggers(trig_ch, sample_rate, threshold_v=0.30, min_gap_us=500):
     """
-    Find rising-edge positions of radar range-trigger pulses in CH1.
+    Find rising-edge positions of radar range-trigger pulses in CH2 (TRIG).
 
     Returns
     -------
@@ -396,9 +402,9 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
     dt     = 1.0 / sample_rate
     total  = len(ch_data[0])
 
-    # Detect trigger pulses for annotation
-    if 1 in ch_data:
-        trig_idx, prf = detect_triggers(ch_data[1], sample_rate)
+    # Detect trigger pulses from CH2 (TRIG) for annotation
+    if CH_TRIG in ch_data:
+        trig_idx, prf = detect_triggers(ch_data[CH_TRIG], sample_rate)
         prf_str = f'PRF ≈ {prf:.0f} Hz' if prf > 0 else 'PRF: n/a'
     else:
         trig_idx, prf_str = np.array([]), ''
@@ -419,7 +425,8 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
     for ch, ax in enumerate(axes1):
         ax.set_facecolor('#04060e')
         v_dec = ch_data[ch][::_OVERVIEW_DECIMATE]
-        ax.plot(t_ov, v_dec, lw=0.5, color='#40c060' if ch == 0 else '#60a0ff')
+        # VIDEO (CH3) in green; digital pulse channels in blue
+        ax.plot(t_ov, v_dec, lw=0.5, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
         ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
                       color='#80b080', fontsize=7.5)
         ax.set_ylim(-vrange * 1.05, vrange * 1.05)
@@ -428,10 +435,10 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
         ax.spines[:].set_color('#1a2a2a')
         ax.grid(True, alpha=0.15, color='#304050')
 
-        # Mark heading pulses (CH3) on all channels as vertical bands
-        if ch == 3 and len(trig_idx) > 0:
+        # Mark TRIG pulse positions on all channels (shows sweep cadence)
+        if len(trig_idx) > 0:
             for ti in trig_idx[::max(1, len(trig_idx) // 200)]:
-                ax.axvline(ti * dt, color='#ff8030', lw=0.4, alpha=0.35)
+                ax.axvline(ti * dt, color='#ff8030', lw=0.3, alpha=0.25)
 
     axes1[-1].set_xlabel('Time (s)', color='#5080a0', fontsize=8)
     # Mark approximate antenna revolution period
@@ -461,7 +468,7 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
     for ch, ax in enumerate(axes2):
         ax.set_facecolor('#04060e')
         ax.plot(t_zoom, ch_data[ch][:zoom_n],
-                lw=0.7, color='#40c060' if ch == 0 else '#60a0ff')
+                lw=0.7, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
         ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
                       color='#80b080', fontsize=7.5)
         ax.set_ylim(-vrange * 1.05, vrange * 1.05)
@@ -477,7 +484,7 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
 
     axes2[-1].set_xlabel('Time (ms)', color='#5080a0', fontsize=8)
 
-    # Range-calibration ticks on VIDEO (CH0) x-axis
+    # Range-calibration ticks on VIDEO (CH3) x-axis
     c      = 299_792_458
     r_res  = c / (2 * sample_rate)          # m per sample
     r_nms  = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
@@ -485,15 +492,15 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
         r_m    = r_nm * 1852
         t_ms   = r_m / (c / 2) * 1e3       # two-way travel time in ms
         if t_ms < _ZOOM_MS:
-            axes2[0].axvline(t_ms, color='#808020', lw=0.7,
-                             ls='--', alpha=0.55)
-            axes2[0].text(t_ms, vrange * 0.75, f'{r_nm} NM',
-                          color='#a0a030', fontsize=6, ha='center')
+            axes2[CH_VIDEO].axvline(t_ms, color='#808020', lw=0.7,
+                                    ls='--', alpha=0.55)
+            axes2[CH_VIDEO].text(t_ms, vrange * 0.75, f'{r_nm} NM',
+                                 color='#a0a030', fontsize=6, ha='center')
 
     plt.tight_layout()
 
-    # ── Figure 3 : FFT of VIDEO channel ───────────────────────────────────────
-    v       = ch_data[0]
+    # ── Figure 3 : FFT of VIDEO channel (CH3) ────────────────────────────────
+    v       = ch_data[CH_VIDEO]
     N_fft   = min(len(v), 4 * 1024 * 1024)   # cap at 4 M points for speed
     win     = np.hanning(N_fft)
     sp      = np.abs(np.fft.rfft(v[:N_fft] * win)) * 2 / N_fft
@@ -506,7 +513,7 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
     ax3.set_ylim(-90, 5)
     ax3.set_xlabel('Frequency (kHz)', color='#5080a0', fontsize=9)
     ax3.set_ylabel('Amplitude (dBV)', color='#5080a0', fontsize=9)
-    ax3.set_title('VIDEO Channel (CH0) — Frequency Spectrum  |  Hanning window',
+    ax3.set_title('VIDEO Channel (CH3) — Frequency Spectrum  |  Hanning window',
                   color='#80b0d0', fontsize=10)
     ax3.tick_params(colors='#304050', labelsize=7)
     ax3.spines[:].set_color('#1a2a2a')
@@ -524,7 +531,7 @@ if __name__ == '__main__':
     # ── Acquisition parameters ────────────────────────────────────────────────
     card_num    = 0              # 0 = first card
 
-    # Scan CH0–CH3 simultaneously (VIDEO, TRIG, BP, HD)
+    # Scan CH0–CH3 simultaneously (HD, BP, TRIG, VIDEO)
     channel     = 3              # last channel index → scans CH0-CH3
 
     # ±5 V range covers the full VIDEO signal (≈4 Vp-p) and digital pulses
@@ -555,9 +562,9 @@ if __name__ == '__main__':
               f'min={v.min():+.3f} V   max={v.max():+.3f} V   '
               f'rms={np.sqrt(np.mean(v**2)):.4f} V')
 
-    # Detect triggers and report PRF
-    if 1 in ch_data:
-        trig_idx, prf = detect_triggers(ch_data[1], sr)
+    # Detect triggers and report PRF  (CH2 = TRIG)
+    if CH_TRIG in ch_data:
+        trig_idx, prf = detect_triggers(ch_data[CH_TRIG], sr)
         print(f'\n  Detected {len(trig_idx)} TRIG pulses  →  PRF ≈ {prf:.0f} Hz')
         if prf > 0:
             sweep_samples = int(sr / prf)
