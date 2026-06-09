@@ -532,22 +532,28 @@ if __name__ == '__main__':
     card_num    = 0              # 0 = first card
 
     # Scan CH0–CH3 simultaneously (HD, BP, TRIG, VIDEO)
-    channel     = 3              # last channel index → scans CH0-CH3
+    channel   = 3                # last channel index → scans CH0-CH3
+    ad_range  = AD_B_5_V         # ±5 V — covers VIDEO (≈4 Vp-p) and digital pulses
+    file_name = '9812d'          # driver writes 9812d.dat (binary int16, interleaved)
 
-    # ±5 V range covers the full VIDEO signal (≈4 Vp-p) and digital pulses
-    ad_range    = AD_B_5_V
+    # VIDEO sampling rate — all 4 channels run at this clock rate simultaneously.
+    # Increase for better range resolution on the VIDEO channel (CH3):
+    #
+    #   sample_rate   Range res    Bins / 3 NM   File size / 15 s
+    #   ───────────   ─────────    ───────────   ────────────────
+    #   1_000_000     149.9 m           41         ~120 MB
+    #   2_000_000      75.0 m           80         ~240 MB
+    #   5_000_000      30.0 m          189         ~600 MB
+    #  10_000_000      15.0 m          374        ~1200 MB
+    #  20_000_000       7.5 m          745        ~2400 MB
+    #
+    sample_rate = 1_000_000.0    # ← change this (1_000_000 to 20_000_000)
 
-    file_name   = '9812d'        # driver writes 9812d.dat (binary int16, interleaved)
+    # Double-buffer size scales with sample_rate to keep half-period ≈ 0.5 s:
+    #   read_count = 2 × 0.5 s × sample_rate × N_channels
+    read_count  = int(2 * 0.5 * sample_rate * 4)   # auto-sized to ~0.5 s half
 
-    # 1 MHz scan rate ×4 ch = 4 MS/s aggregate  (max card: 20 MS/s)
-    # Range resolution = c / (2 × 1 MHz) = 149.9 m / sample
-    sample_rate = 1_000_000.0
-
-    # Double-buffer: 4 000 000 samples = 1 s total, 0.5 s per half-buffer
-    # (4 ch × 1 M scans/s × 0.5 s = 2 M samples per half → fires every 0.5 s)
-    read_count  = 4_000_000
-
-    duration_s  = 15.0           # capture 15 seconds = 60 M samples = ~120 MB
+    duration_s  = 15.0           # capture duration → file size ≈ sample_rate×4×duration_s×2 bytes
 
     # ── Run acquisition ───────────────────────────────────────────────────────
     ch_data, sr = acquire(
