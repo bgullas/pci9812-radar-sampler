@@ -264,6 +264,20 @@ class DASK:
 # Acquisition — identical logic to the C program
 # ---------------------------------------------------------------------------
 
+def _dma_align(n_scans_per_half, n_ch):
+    """
+    Round n_scans_per_half up to the nearest power-of-2 multiple of 512.
+    The PCI-9812 DMA engine requires the half-buffer size (in scans) to be a
+    multiple of 512 for reliable operation; examples in the ADLINK SDK always
+    use power-of-2 counts.  Returns total uint16 samples (both halves).
+    """
+    import math
+    # Align scans_per_half to the next power of 2 that is also ≥ 512
+    k = max(9, math.ceil(math.log2(max(n_scans_per_half, 1))))  # 2^9 = 512 minimum
+    aligned = 1 << k
+    return aligned * 2 * n_ch   # total uint16 in the double-buffer
+
+
 def acquire(channel, ad_range, file_name, read_count, sample_rate,
             card_num=0, duration_s=5.0):
     """
@@ -271,19 +285,62 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
 
     channel     : last channel index (e.g. 3 → scans CH0–CH3)
     ad_range    : AD_B_5_V or AD_B_1_V
-    file_name   : output base name (driver appends .dat)
-    read_count  : circular buffer size in samples
+    file_name   : output base name WITHOUT extension; driver appends .dat.
+                  Use an absolute path (e.g. r'C:\\tmp\\9812d') to avoid
+                  working-directory surprises.
+    read_count  : circular buffer size in total uint16 samples (both halves,
+                  all channels).  Call _dma_align() to compute a valid value.
     sample_rate : samples/second per channel
-    duration_s  : how long to run (replaces kbhit() from C)
+    duration_s  : how long to run
     """
+    import math
+
     n_ch   = channel + 1
     vrange = 5.0 if ad_range == AD_B_5_V else 1.0
 
+    # ── Enforce DMA alignment ─────────────────────────────────────────────────
+    # The half-buffer in scans must be a power of 2. Check and fix silently.
+    scans_per_half   = read_count // 2 // n_ch
+    k                = max(9, math.ceil(math.log2(max(scans_per_half, 1))))
+    aligned_scans    = 1 << k
+    aligned_count    = aligned_scans * 2 * n_ch
+    if aligned_count != read_count:
+        print(f'  [DMA align]  read_count {read_count} → {aligned_count}  '
+              f'(scans/half {scans_per_half} → {aligned_scans})')
+        read_count = aligned_count
+
+    # ── Resolve file path to absolute so driver can always create the file ────
+    if not os.path.isabs(file_name):
+        file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 file_name)
+    dat_path = file_name + '.dat'
+
+    # Remove any leftover .dat from a previous crashed run so the driver can
+    # create a fresh file (some driver versions return -15 if it exists).
+    if os.path.exists(dat_path):
+        try:
+            os.remove(dat_path)
+            print(f'  [cleanup]    removed stale {dat_path}')
+        except OSError as e:
+            print(f'  [warning]    could not remove {dat_path}: {e}')
+
+    half_count    = read_count // 2
+    half_period_s = half_count / (sample_rate * n_ch)
+
     print(f'PCI-9812  CH0–CH{channel}  {sample_rate:.0f} S/s  '
-          f'buffer={read_count}  → {file_name}.dat')
+          f'buffer={read_count} ({half_period_s*1000:.0f} ms/half)  '
+          f'→ {dat_path}')
 
     dask = DASK()
     card = dask.Register_Card(PCI_9812, card_num)
+
+    # Clear any acquisition state left by a previous run that did not exit
+    # cleanly (card stuck in "running" state causes AI_ContScanChannelsToFile
+    # to return -15 immediately).
+    try:
+        dask.AI_AsyncClear(card)
+    except Exception:
+        pass   # ignore — card may not have been running
 
     dask.AI_9812_Config(
         card,
@@ -300,35 +357,32 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
         read_count, sample_rate, ASYNCH_OP,
     )
 
-    count      = 0
-    half_count = read_count // 2
-    deadline   = time.monotonic() + duration_s
-    # half-buffer period in seconds: used to sleep just under one half-buffer
-    # to avoid busy-spinning while the DMA fills (saves ~100 % CPU)
-    half_period_s = (read_count // 2) / (sample_rate * (channel + 1))
-    sleep_s = max(0.005, half_period_s * 0.45)
+    count    = 0
+    deadline = time.monotonic() + duration_s
+    sleep_s  = max(0.005, half_period_s * 0.45)
 
     print(f'Acquiring for {duration_s}s  '
-          f'(half-buffer fires every ~{half_period_s*1000:.0f} ms) …')
+          f'(half-buffer ≈ {half_period_s*1000:.0f} ms) …')
     while time.monotonic() < deadline:
         half_ready, f_stop = dask.AI_AsyncDblBufferHalfReady(card)
         if half_ready:
-            dask.AI_AsyncDblBufferTransfer(card, buf=None)
+            # AI_ContScanChannelsToFile writes directly to disk — no transfer needed.
             count += half_count
             elapsed = duration_s - (deadline - time.monotonic())
             print(f'\r  {count:>12,} samples  |  {elapsed:.1f} / {duration_s:.0f} s',
                   end='', flush=True)
         else:
-            time.sleep(sleep_s)   # yield CPU until next half-buffer is ready
+            time.sleep(sleep_s)
         if f_stop:
             break
 
     total = dask.AI_AsyncClear(card)
     dask.Release_Card(card)
-    print(f'\n{count} samples written to {file_name}.dat  (total={total})')
+    print(f'\n{count} samples written  (AI_AsyncClear total={total})')
+    print(f'  file: {dat_path}  ({os.path.getsize(dat_path)//1024//1024} MB)')
 
     # Read back and convert to volts
-    raw    = np.fromfile(f'{file_name}.dat', dtype=np.int16)
+    raw    = np.fromfile(dat_path, dtype=np.int16)
     result = {}
     for ch in range(n_ch):
         raw_ch     = raw[ch::n_ch].astype(np.float32)
@@ -534,7 +588,9 @@ if __name__ == '__main__':
     # Scan CH0–CH3 simultaneously (HD, BP, TRIG, VIDEO)
     channel   = 3                # last channel index → scans CH0-CH3
     ad_range  = AD_B_5_V         # ±5 V — covers VIDEO (≈4 Vp-p) and digital pulses
-    file_name = '9812d'          # driver writes 9812d.dat (binary int16, interleaved)
+    # Use absolute path — PCIS-DASK resolves relative paths from the DLL
+    # directory, not the script's CWD, which can silently fail (error -15).
+    file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
 
     # VIDEO sampling rate — all 4 channels run at this clock rate simultaneously.
     # Increase for better range resolution on the VIDEO channel (CH3):
@@ -549,9 +605,11 @@ if __name__ == '__main__':
     #
     sample_rate = 1_000_000.0    # ← change this (1_000_000 to 20_000_000)
 
-    # Double-buffer size scales with sample_rate to keep half-period ≈ 0.5 s:
-    #   read_count = 2 × 0.5 s × sample_rate × N_channels
-    read_count  = int(2 * 0.5 * sample_rate * 4)   # auto-sized to ~0.5 s half
+    # Buffer size: half-period ≈ 0.5 s, then DMA-aligned to the next power of 2
+    # in scans.  _dma_align() rounds up so the half-buffer is always a power-of-2
+    # multiple of 512 scans — required by the PCI-9812 DMA engine.
+    n_ch       = channel + 1
+    read_count = _dma_align(int(0.5 * sample_rate), n_ch)   # auto DMA-aligned
 
     duration_s  = 15.0           # capture duration → file size ≈ sample_rate×4×duration_s×2 bytes
 
