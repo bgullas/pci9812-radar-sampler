@@ -24,6 +24,31 @@ if sys.platform != 'win32':
     raise EnvironmentError('This script must run on Windows (PCI-DASK.dll required)')
 
 
+# ===========================================================================
+# USER SETTINGS  ← edit these three values, nothing else needs to change
+# ===========================================================================
+
+SAMPLE_RATE     = 1_000        # S/s — same for ALL 4 channels (HD, BP, TRIG, VIDEO)
+                                #   1_000 = 1 kS/s  (test / low-speed)
+                                #   1_000_000 = 1 MS/s  |  149.9 m range res
+                                #   5_000_000 = 5 MS/s  |   30.0 m range res
+                                #  20_000_000 = 20 MS/s |    7.5 m range res
+
+VOLTAGE_RANGE_V = 5.0          # V — input range per channel: 5.0 or 1.0
+                                #   5.0 → AD_B_5_V  (covers 12 V digital + VIDEO)
+                                #   1.0 → AD_B_1_V  (more resolution for low-level signals)
+
+DURATION_S      = 15.0         # s — total capture duration
+
+# Driver DMA buffer limit — must match the ADLINK Device Manager setting
+# (PCI-9812 → Properties → DMA Buffer Size).  Default after install is 1 MB.
+# Increase both here and in the driver when moving to higher sample rates:
+#   1 MS/s requires  8 MB  |  5 MS/s → 64 MB  |  20 MS/s → 256 MB
+DRIVER_DMA_LIMIT_MB = 1        # MB
+
+# ===========================================================================
+
+
 _ADLINK_DIRS = [
     os.path.dirname(os.path.abspath(__file__)),
     r'C:\ADLINK\PCI-DASK',
@@ -582,52 +607,33 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # ── Acquisition parameters ────────────────────────────────────────────────
-    card_num   = 0
-    channel    = 3          # last channel index → scans CH0–CH3 simultaneously
-    ad_range   = AD_B_5_V   # ±5 V (covers VIDEO ≈ 4 Vp-p and 12 V digital pulses)
-    file_name  = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
-    duration_s = 15.0
+    # ── Resolve user settings ─────────────────────────────────────────────────
+    sample_rate = float(SAMPLE_RATE)
+    ad_range    = AD_B_5_V if VOLTAGE_RANGE_V >= 5.0 else AD_B_1_V
+    vrange      = 5.0      if VOLTAGE_RANGE_V >= 5.0 else 1.0
+    duration_s  = float(DURATION_S)
 
-    # ── Sampling rate  (same for ALL four channels — HD, BP, TRIG, VIDEO) ────
-    #
-    # The PCI-9812 has one shared clock: every channel is sampled at exactly
-    # this rate.  Higher rates give finer range resolution on the VIDEO channel.
-    #
-    #   sample_rate   Range res (VIDEO)   File size / 15 s
-    #   ───────────   ─────────────────   ────────────────
-    #   1_000_000          149.9 m            ~120 MB
-    #   2_000_000           75.0 m            ~240 MB
-    #   5_000_000           30.0 m            ~600 MB
-    #  10_000_000           15.0 m           ~1200 MB
-    #  20_000_000            7.5 m           ~2400 MB
-    #
-    sample_rate = 1_000_000.0   # ← change this (1_000_000 to 20_000_000)
+    card_num  = 0
+    channel   = 3     # scans CH0–CH3 simultaneously
+    file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
 
-    # ── Driver DMA buffer limit ───────────────────────────────────────────────
-    # Set DRIVER_DMA_LIMIT_MB to the value configured in the ADLINK Device
-    # Manager (PCI-9812 → Properties → DMA Buffer Size).  The default after
-    # installation is 1 MB.  If read_count would exceed this limit the driver
-    # returns error -15.
-    #
-    # Required minimum per rate (to keep half-period ≈ 0.5 s):
-    #   1 MS/s  →  8 MB   |   5 MS/s  →  64 MB   |  20 MS/s  → 256 MB
-    #
-    # With 1 MB (default), half-period = 65 ms at all rates — still correct,
-    # just more frequent disk writes.  Increase the driver setting and this
-    # value together to get longer half-periods and fewer writes.
-    DRIVER_DMA_LIMIT_MB = 1     # ← match your ADLINK driver DMA Buffer setting
-
-    # Compute read_count: target ~0.5 s per half, capped to the driver limit.
+    # ── Compute DMA buffer (capped to driver limit) ───────────────────────────
     n_ch = channel + 1
     driver_max_scans_half = (DRIVER_DMA_LIMIT_MB * 1024 * 1024 // 2) // (n_ch * 2)
     target_scans_half     = int(0.5 * sample_rate)
     read_count = _dma_align(min(target_scans_half, driver_max_scans_half), n_ch)
 
+    def _fmt_rate(hz):
+        if hz >= 1e6:  return f'{hz/1e6:.4g} MS/s'
+        if hz >= 1e3:  return f'{hz/1e3:.4g} kS/s'
+        return f'{hz:.0f} S/s'
+
     half_period_ms = (read_count // 2) / (sample_rate * n_ch) * 1000
-    print(f'  sample_rate = {sample_rate/1e6:.0f} MS/s  |  '
-          f'read_count = {read_count} ({read_count*2//1024} KB)  |  '
-          f'half-period ≈ {half_period_ms:.0f} ms')
+    print(f'  rate = {_fmt_rate(sample_rate)}  |  '
+          f'±{vrange:.0f} V  |  '
+          f'duration = {duration_s:.0f} s  |  '
+          f'buf = {read_count} ({read_count*2//1024} KB)  |  '
+          f'half ≈ {half_period_ms:.0f} ms')
 
     # ── Run acquisition ───────────────────────────────────────────────────────
     ch_data, sr = acquire(
@@ -635,7 +641,6 @@ if __name__ == '__main__':
         card_num=card_num, duration_s=duration_s,
     )
 
-    vrange = 5.0 if ad_range == AD_B_5_V else 1.0
     print('\nChannel statistics:')
     for ch, v in ch_data.items():
         print(f'  CH{ch}  {CH_LABELS.get(ch,""):28s}'
