@@ -153,6 +153,14 @@ class _DLL:
     def transfer(self, card, dst_ptr):
         self._d.AI_AsyncDblBufferTransfer(ctypes.c_int16(card), dst_ptr)
 
+    def hw_count(self, card):
+        stopped = ctypes.c_uint16(0)
+        count   = ctypes.c_uint32(0)
+        self._d.AI_AsyncCheck(ctypes.c_int16(card),
+                               ctypes.byref(stopped),
+                               ctypes.byref(count))
+        return count.value
+
     def clear(self, card):
         n = ctypes.c_uint32(0)
         self._d.AI_AsyncClear(ctypes.c_int16(card), ctypes.byref(n))
@@ -188,6 +196,7 @@ class _Capture(threading.Thread):
     def _run(self):
         dll  = _DLL()
         card = dll.register_card()
+        print(f'  Register_Card OK  (card={card})')
 
         try:
             dll.clear(card)
@@ -195,7 +204,9 @@ class _Capture(threading.Thread):
             pass
 
         dll.config(card)
+        print('  AI_9812_Config OK  (trig_src=CH2, soft trigger)')
         dll.dbl_buf_mode(card)
+        print('  AI_AsyncDblBufferMode OK')
 
         main_buf = np.zeros(READ_COUNT, dtype=np.uint16)
         main_ptr = main_buf.ctypes.data_as(
@@ -205,8 +216,13 @@ class _Capture(threading.Thread):
         half_ptr = half_buf.ctypes.data_as(ctypes.c_void_p)
 
         dll.start_scan(card, main_ptr)
+        print(f'  AI_ContScanChannels started  '
+              f'(read_count={READ_COUNT}, {SAMPLE_RATE} S/s)')
+        print('  Polling for half-ready...')
 
-        sleep_s = (HALF_SCANS / SAMPLE_RATE) * 0.10
+        sleep_s  = (HALF_SCANS / SAMPLE_RATE) * 0.10
+        last_hb  = time.monotonic()
+        HB_S     = 2.0   # heartbeat every 2 s
 
         try:
             while not self._quit.is_set():
@@ -217,7 +233,17 @@ class _Capture(threading.Thread):
                     with self.lock:
                         self.buf.extend(volts)
                     self.halves += 1
+                    print(f'\r  half #{self.halves:>4}  '
+                          f'hw={dll.hw_count(card):>8}  '
+                          f'CH3 min={volts.min():+.3f} max={volts.max():+.3f} V',
+                          end='', flush=True)
                 else:
+                    now = time.monotonic()
+                    if now - last_hb >= HB_S:
+                        hw = dll.hw_count(card)
+                        print(f'  waiting... hw_count={hw}  halves={self.halves}',
+                              flush=True)
+                        last_hb = now
                     time.sleep(sleep_s)
         finally:
             try:
