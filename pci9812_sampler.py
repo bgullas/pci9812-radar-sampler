@@ -382,12 +382,19 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
         read_count, sample_rate, ASYNCH_OP,
     )
 
-    count    = 0
-    deadline = time.monotonic() + duration_s
-    sleep_s  = max(0.005, half_period_s * 0.45)
+    count          = 0
+    overrun_warned = False
+    deadline       = time.monotonic() + duration_s
+    sleep_s        = max(0.005, half_period_s * 0.45)
 
     print(f'Acquiring for {duration_s}s  '
           f'(half-buffer ≈ {half_period_s*1000:.0f} ms) …')
+    # The double-buffer recirculates continuously; the driver appends each
+    # completed half to the .dat file.  We run for the FULL duration — the
+    # buffer size (read_count) only sets how often a half completes, NOT the
+    # total capture length.  Do NOT break on f_stop: in continuous mode it
+    # signals a buffer-overrun/stop, and breaking on it truncates the capture
+    # to a single buffer.  Warn once and keep flushing until the deadline.
     while time.monotonic() < deadline:
         half_ready, f_stop = dask.AI_AsyncDblBufferHalfReady(card)
         if half_ready:
@@ -398,8 +405,10 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
                   end='', flush=True)
         else:
             time.sleep(sleep_s)
-        if f_stop:
-            break
+        if f_stop and not overrun_warned:
+            print('\n  [warning] double-buffer stop/overrun flag set — '
+                  'continuing to capture until deadline')
+            overrun_warned = True
 
     total = dask.AI_AsyncClear(card)
     dask.Release_Card(card)
@@ -495,9 +504,12 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
         if hz >= 1e3:  return f'{hz/1e3:.4g} kS/s'
         return f'{hz:.0f} S/s'
 
-    # Decimate for plotting only — keeps rendering fast for long captures
+    # Decimate for plotting only — keeps rendering fast for long captures.
+    # Build the time axis and the y-samples from the SAME index array so their
+    # lengths always match and the x-axis always spans the full capture.
     decimate = max(1, total // 200_000)
-    t = np.arange(0, total, decimate) * dt
+    idx = np.arange(0, total, decimate)
+    t   = idx * dt
 
     fig, axes = plt.subplots(n_ch, 1, figsize=(15, 2.6 * n_ch),
                               sharex=True, facecolor='#0a0a14')
@@ -512,7 +524,7 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
 
     for ch, ax in enumerate(axes):
         ax.set_facecolor('#04060e')
-        ax.plot(t, ch_data[ch][::decimate],
+        ax.plot(t, ch_data[ch][idx],
                 lw=0.6, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
         ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
                       color='#80b080', fontsize=9)
@@ -547,24 +559,17 @@ if __name__ == '__main__':
     channel   = 3     # scans CH0–CH3 simultaneously
     file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
 
-    # ── Compute DMA buffer sized to capture the full duration ─────────────────
-    # read_count = aligned_half * 2 * n_ch must satisfy:
-    #   read_count / n_ch / sample_rate  >=  duration_s   (covers full capture)
-    #   read_count * 2 bytes             <=  driver DMA limit (no error -15)
+    # ── Circular DMA buffer (recirculates continuously to file) ───────────────
+    # read_count is the size of the double-buffer, NOT the total capture length.
+    # The buffer recirculates and the driver appends each completed half to the
+    # .dat file for as long as we poll.  Total capture length = duration_s.
+    # Keep the buffer modest (~0.25 s) and within the driver's DMA limit so it
+    # turns over often and never hits error -15.
     n_ch = channel + 1
     driver_max_scans_half = (DRIVER_DMA_LIMIT_MB * 1024 * 1024 // 2) // (n_ch * 2)
-    total_scans       = int(duration_s * sample_rate)
-    half_scans_needed = (total_scans + 1) // 2
-    half_scans_capped = min(half_scans_needed, driver_max_scans_half)
-    read_count  = _dma_align(half_scans_capped, n_ch)
-    actual_s    = read_count / n_ch / sample_rate   # true capture length
-    timeout_s   = actual_s + 10                     # safety deadline for acquire()
-
-    if half_scans_needed > driver_max_scans_half:
-        print(f'  WARNING: duration requires {half_scans_needed * 2 * n_ch * 2 // 1024} KB DMA buffer '
-              f'but driver limit is {DRIVER_DMA_LIMIT_MB} MB. '
-              f'Capture will be truncated to {actual_s:.1f} s. '
-              f'Increase DRIVER_DMA_LIMIT_MB in ADLINK Device Manager.')
+    target_scans_half     = int(0.25 * sample_rate)
+    half_scans            = max(1, min(target_scans_half, driver_max_scans_half))
+    read_count            = _dma_align(half_scans, n_ch)
 
     def _fmt_rate(hz):
         if hz >= 1e6:  return f'{hz/1e6:.4g} MS/s'
@@ -574,14 +579,13 @@ if __name__ == '__main__':
     half_period_ms = (read_count // 2) / (sample_rate * n_ch) * 1000
     print(f'  rate = {_fmt_rate(sample_rate)}  |  '
           f'±{vrange:.0f} V  |  '
-          f'capture = {actual_s:.1f} s  |  '
-          f'buf = {read_count} ({read_count*2//1024} KB)  |  '
-          f'half ≈ {half_period_ms:.0f} ms')
+          f'duration = {duration_s:.0f} s  |  '
+          f'buf = {read_count} ({read_count*2//1024} KB, {half_period_ms:.0f} ms/half)')
 
     # ── Run acquisition ───────────────────────────────────────────────────────
     ch_data, sr = acquire(
         channel, ad_range, file_name, read_count, sample_rate,
-        card_num=card_num, duration_s=timeout_s,
+        card_num=card_num, duration_s=duration_s,
     )
 
     print('\nChannel statistics:')
