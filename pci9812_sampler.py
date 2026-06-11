@@ -403,14 +403,19 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
 
     total = dask.AI_AsyncClear(card)
     dask.Release_Card(card)
+    file_bytes = os.path.getsize(dat_path)
     print(f'\n{count} samples written  (AI_AsyncClear total={total})')
-    print(f'  file: {dat_path}  ({os.path.getsize(dat_path)//1024//1024} MB)')
+    print(f'  file: {dat_path}  ({file_bytes // 1024} KB / {file_bytes // 1024 // 1024} MB)')
 
     # Read back and convert to volts.
     # Trim to the nearest complete scan so every channel has the same length
     # (the DMA can stop mid-scan, leaving a non-multiple-of-n_ch file size).
     raw = np.fromfile(dat_path, dtype=np.int16)
     raw = raw[: len(raw) // n_ch * n_ch]
+    samples_per_ch = len(raw) // n_ch
+    print(f'  read back: {len(raw)} uint16  →  '
+          f'{samples_per_ch} samples/ch  ≈  '
+          f'{samples_per_ch / sample_rate:.2f} s')
     result = {}
     for ch in range(n_ch):
         raw_ch     = raw[ch::n_ch].astype(np.float32)
@@ -496,9 +501,10 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
 
     fig, axes = plt.subplots(n_ch, 1, figsize=(15, 2.6 * n_ch),
                               sharex=True, facecolor='#0a0a14')
+    actual_duration = total * dt
     fig.suptitle(
         f'PCI-9812  Radar Signals  —  {_fmt_rate(sample_rate)}  ·  '
-        f'{duration_s:.0f} s  ·  {prf_str}',
+        f'{actual_duration:.1f} s captured  ·  {prf_str}',
         fontsize=11, color='#d0e8d0',
     )
     if n_ch == 1:
@@ -509,10 +515,10 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
         ax.plot(t, ch_data[ch][::decimate],
                 lw=0.6, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
         ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
-                      color='#80b080', fontsize=7.5)
+                      color='#80b080', fontsize=9)
         ax.set_ylim(-vrange * 1.05, vrange * 1.05)
         ax.axhline(0, color='#1a2a1a', lw=0.4, ls='--')
-        ax.tick_params(colors='#304050', labelsize=7)
+        ax.tick_params(axis='y', colors='#304050', labelsize=8)
         ax.spines[:].set_color('#1a2a2a')
         ax.grid(True, alpha=0.15, color='#304050')
 
@@ -520,7 +526,8 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
             for ti in trig_idx[::max(1, len(trig_idx) // 200)]:
                 ax.axvline(ti * dt, color='#ff8030', lw=0.3, alpha=0.25)
 
-    axes[-1].set_xlabel('Time (s)', color='#5080a0', fontsize=8)
+    axes[-1].set_xlabel('Time (s)', color='#5080a0', fontsize=12)
+    axes[-1].tick_params(axis='x', colors='#7090b0', labelsize=11)
     plt.tight_layout()
     plt.show()
 
