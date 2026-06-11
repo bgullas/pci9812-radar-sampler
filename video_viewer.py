@@ -1,9 +1,8 @@
 """
 Real-time VIDEO (CH3) radar echo viewer — 20 kHz, 1-second rolling window.
 
-Standalone: does NOT import from pci9812_sampler.py.
-Scans all 4 channels simultaneously (PCI-9812 requirement) and displays
-only CH3 (VIDEO / radar echo) as a 1-second rolling time series.
+Reads CH3 only via AI_ContReadChannel (single-channel continuous DMA).
+No interleaving, no trigger dependency — free-runs as soon as started.
 
 Usage:  python video_viewer.py
 Press Ctrl-C or close the window to stop.
@@ -20,37 +19,34 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-SAMPLE_RATE   = 20_000     # S/s — scans per second (all 4 ch simultaneously)
+SAMPLE_RATE   = 20_000     # S/s
 VOLTAGE_RANGE = 5.0        # ±5 V
 WINDOW_S      = 1.0        # seconds shown in rolling window
 CARD_NUM      = 0
+CHANNEL       = 3          # CH3 = VIDEO (radar echo)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Constants verified from dask.h on this system (C:\ADLINK\PCIS-DASK\Include\)
+# Constants from dask.h (C:\ADLINK\PCIS-DASK\Include\)
 PCI_9812          = 30
 AD_B_5_V          = 2
 P9812_TRGMOD_SOFT = 0
-P9812_TRGSRC_CH2  = 16     # 0x10
+P9812_TRGSRC_CH0  = 0
 P9812_TRGSLP_POS  = 0
 P9812_AD2_GT_PCI  = 128    # 0x80
 P9812_CLKSRC_INT  = 0
 ASYNCH_OP         = 2
 ADC_MID           = 2048
+ADC_MID_F         = 2048.0
 
-N_CH          = 4
-VIDEO_CH      = 3           # CH3 = VIDEO (radar echo)
-ADC_MID_F     = float(ADC_MID)
+# Double-buffer: 4000 samples total → 2000 per half → 100 ms per half at 20 kHz
+READ_COUNT   = 4_000
+HALF_COUNT   = READ_COUNT // 2
+HALF_MS      = HALF_COUNT / SAMPLE_RATE * 1000
 
-# Double-buffer — matches the working C reference (read_count=4000)
-# At 20 kHz / 4 ch: 4000 uint16 = 500 scans/half = 25 ms per half
-READ_COUNT    = 4_000
-HALF_COUNT    = READ_COUNT // 2
-HALF_SCANS    = HALF_COUNT // N_CH
-
-WINDOW_SAMPS  = int(SAMPLE_RATE * WINDOW_S)
+WINDOW_SAMPS = int(SAMPLE_RATE * WINDOW_S)
 
 
-# ── Minimal DLL wrapper (standalone — no pci9812_sampler needed) ──────────────
+# ── DLL wrapper ───────────────────────────────────────────────────────────────
 
 _DLL_SEARCH = [
     os.path.dirname(os.path.abspath(__file__)),
@@ -60,6 +56,7 @@ _DLL_SEARCH = [
     r'C:\ADLINK\PCI-DASK',
 ]
 
+
 def _load_dll():
     for d in _DLL_SEARCH:
         p = os.path.join(d, 'PCI-Dask64.dll')
@@ -68,42 +65,27 @@ def _load_dll():
                 os.add_dll_directory(d)
             print(f'Found PCI-Dask64.dll: {p}')
             return ctypes.WinDLL(p)
-    raise FileNotFoundError(
-        'PCI-Dask64.dll not found. Copy it next to this script or add its '
-        'folder to PATH.'
-    )
+    raise FileNotFoundError('PCI-Dask64.dll not found')
 
 
 class _DLL:
-    """Thin ctypes wrapper — only the calls this viewer needs."""
-
     def __init__(self):
         d = _load_dll()
         I16 = ctypes.c_int16
         U16 = ctypes.c_uint16
         U32 = ctypes.c_uint32
         F64 = ctypes.c_double
+        PU16 = ctypes.POINTER(U16)
 
-        d.Register_Card.argtypes              = [U16, U16]
-        d.Register_Card.restype               = I16
-        d.AI_9812_Config.argtypes             = [I16, U16, U16, U16, U16, U16, U32]
-        d.AI_9812_Config.restype              = I16
-        d.AI_AsyncDblBufferMode.argtypes      = [I16, U16]
-        d.AI_AsyncDblBufferMode.restype       = I16
-        d.AI_ContScanChannels.argtypes        = [I16, U16, U16,
-                                                 ctypes.POINTER(U16),
-                                                 U32, F64, U16]
-        d.AI_ContScanChannels.restype         = I16
-        d.AI_AsyncDblBufferHalfReady.argtypes = [I16,
-                                                 ctypes.POINTER(U16),
-                                                 ctypes.POINTER(U16)]
-        d.AI_AsyncDblBufferHalfReady.restype  = I16
-        d.AI_AsyncDblBufferTransfer.argtypes  = [I16, ctypes.c_void_p]
-        d.AI_AsyncDblBufferTransfer.restype   = I16
-        d.AI_AsyncClear.argtypes              = [I16, ctypes.POINTER(U32)]
-        d.AI_AsyncClear.restype               = I16
-        d.Release_Card.argtypes               = [I16]
-        d.Release_Card.restype                = I16
+        d.Register_Card.argtypes              = [U16, U16];          d.Register_Card.restype = I16
+        d.AI_9812_Config.argtypes             = [I16, U16, U16, U16, U16, U16, U32]; d.AI_9812_Config.restype = I16
+        d.AI_AsyncDblBufferMode.argtypes      = [I16, U16];          d.AI_AsyncDblBufferMode.restype = I16
+        d.AI_ContReadChannel.argtypes         = [I16, U16, U16, PU16, U32, F64, U16]; d.AI_ContReadChannel.restype = I16
+        d.AI_AsyncDblBufferHalfReady.argtypes = [I16, ctypes.POINTER(U16), ctypes.POINTER(U16)]; d.AI_AsyncDblBufferHalfReady.restype = I16
+        d.AI_AsyncDblBufferTransfer.argtypes  = [I16, ctypes.c_void_p]; d.AI_AsyncDblBufferTransfer.restype = I16
+        d.AI_AsyncCheck.argtypes              = [I16, ctypes.POINTER(U16), ctypes.POINTER(U32)]; d.AI_AsyncCheck.restype = I16
+        d.AI_AsyncClear.argtypes              = [I16, ctypes.POINTER(U32)]; d.AI_AsyncClear.restype = I16
+        d.Release_Card.argtypes               = [I16];               d.Release_Card.restype = I16
         self._d = d
 
     def register_card(self):
@@ -117,7 +99,7 @@ class _DLL:
         e = self._d.AI_9812_Config(
             ctypes.c_int16(card),
             ctypes.c_uint16(P9812_TRGMOD_SOFT),
-            ctypes.c_uint16(P9812_TRGSRC_CH2),
+            ctypes.c_uint16(P9812_TRGSRC_CH0),   # irrelevant in SOFT mode
             ctypes.c_uint16(P9812_TRGSLP_POS),
             ctypes.c_uint16(P9812_AD2_GT_PCI | P9812_CLKSRC_INT),
             ctypes.c_uint16(0x80),
@@ -126,28 +108,26 @@ class _DLL:
         if e: raise RuntimeError(f'AI_9812_Config error={e}')
 
     def dbl_buf_mode(self, card):
-        e = self._d.AI_AsyncDblBufferMode(ctypes.c_int16(card),
-                                           ctypes.c_uint16(1))
+        e = self._d.AI_AsyncDblBufferMode(ctypes.c_int16(card), ctypes.c_uint16(1))
         if e: raise RuntimeError(f'AI_AsyncDblBufferMode error={e}')
 
-    def start_scan(self, card, buf_ptr):
-        e = self._d.AI_ContScanChannels(
+    def start_read_channel(self, card, buf_ptr):
+        e = self._d.AI_ContReadChannel(
             ctypes.c_int16(card),
-            ctypes.c_uint16(N_CH - 1),
+            ctypes.c_uint16(CHANNEL),
             ctypes.c_uint16(AD_B_5_V),
             buf_ptr,
             ctypes.c_uint32(READ_COUNT),
             ctypes.c_double(float(SAMPLE_RATE)),
             ctypes.c_uint16(ASYNCH_OP),
         )
-        if e: raise RuntimeError(f'AI_ContScanChannels error={e}')
+        if e: raise RuntimeError(f'AI_ContReadChannel error={e}')
 
     def half_ready(self, card):
         hr = ctypes.c_uint16(0)
         fs = ctypes.c_uint16(0)
         self._d.AI_AsyncDblBufferHalfReady(ctypes.c_int16(card),
-                                            ctypes.byref(hr),
-                                            ctypes.byref(fs))
+                                            ctypes.byref(hr), ctypes.byref(fs))
         return bool(hr.value)
 
     def transfer(self, card, dst_ptr):
@@ -157,8 +137,7 @@ class _DLL:
         stopped = ctypes.c_uint16(0)
         count   = ctypes.c_uint32(0)
         self._d.AI_AsyncCheck(ctypes.c_int16(card),
-                               ctypes.byref(stopped),
-                               ctypes.byref(count))
+                               ctypes.byref(stopped), ctypes.byref(count))
         return count.value
 
     def clear(self, card):
@@ -204,45 +183,43 @@ class _Capture(threading.Thread):
             pass
 
         dll.config(card)
-        print('  AI_9812_Config OK  (trig_src=CH2, soft trigger)')
+        print('  AI_9812_Config OK  (SOFT trigger / free-run)')
         dll.dbl_buf_mode(card)
         print('  AI_AsyncDblBufferMode OK')
 
+        # Single-channel buffer — no interleaving
         main_buf = np.zeros(READ_COUNT, dtype=np.uint16)
-        main_ptr = main_buf.ctypes.data_as(
-            ctypes.POINTER(ctypes.c_uint16))
+        main_ptr = main_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
 
         half_buf = np.zeros(HALF_COUNT, dtype=np.uint16)
         half_ptr = half_buf.ctypes.data_as(ctypes.c_void_p)
 
-        dll.start_scan(card, main_ptr)
-        print(f'  AI_ContScanChannels started  '
-              f'(read_count={READ_COUNT}, {SAMPLE_RATE} S/s)')
-        print('  Polling for half-ready...')
+        dll.start_read_channel(card, main_ptr)
+        print(f'  AI_ContReadChannel CH{CHANNEL} started  '
+              f'(count={READ_COUNT}, {SAMPLE_RATE} S/s, half={HALF_MS:.0f} ms)')
+        print('  Polling...')
 
-        sleep_s  = (HALF_SCANS / SAMPLE_RATE) * 0.10
-        last_hb  = time.monotonic()
-        HB_S     = 2.0   # heartbeat every 2 s
+        sleep_s = (HALF_COUNT / SAMPLE_RATE) * 0.10
+        last_hb = time.monotonic()
+        HB_S    = 2.0
 
         try:
             while not self._quit.is_set():
                 if dll.half_ready(card):
                     dll.transfer(card, half_ptr)
-                    raw   = half_buf[VIDEO_CH::N_CH].astype(np.float32)
-                    volts = (raw - ADC_MID_F) / ADC_MID_F * VOLTAGE_RANGE
+                    volts = (half_buf.astype(np.float32) - ADC_MID_F) / ADC_MID_F * VOLTAGE_RANGE
                     with self.lock:
                         self.buf.extend(volts)
                     self.halves += 1
                     print(f'\r  half #{self.halves:>4}  '
                           f'hw={dll.hw_count(card):>8}  '
-                          f'CH3 min={volts.min():+.3f} max={volts.max():+.3f} V',
+                          f'CH3 min={volts.min():+.3f}  max={volts.max():+.3f} V   ',
                           end='', flush=True)
                 else:
                     now = time.monotonic()
                     if now - last_hb >= HB_S:
-                        hw = dll.hw_count(card)
-                        print(f'  waiting... hw_count={hw}  halves={self.halves}',
-                              flush=True)
+                        print(f'  waiting...  hw_count={dll.hw_count(card)}  '
+                              f'halves={self.halves}', flush=True)
                         last_hb = now
                     time.sleep(sleep_s)
         finally:
@@ -257,9 +234,7 @@ class _Capture(threading.Thread):
 
 def main():
     print(f'CH3 VIDEO  |  {SAMPLE_RATE/1e3:.0f} kS/s  |  ±{VOLTAGE_RANGE:.0f} V  '
-          f'|  {WINDOW_S:.0f} s window')
-    print(f'Half-buffer: {HALF_SCANS} scans = {HALF_SCANS/SAMPLE_RATE*1000:.0f} ms  '
-          f'→  refreshes ~{1000*HALF_SCANS/SAMPLE_RATE:.0f} ms')
+          f'|  {WINDOW_S:.0f} s window  |  half={HALF_MS:.0f} ms')
 
     cap = _Capture()
     cap.start()
