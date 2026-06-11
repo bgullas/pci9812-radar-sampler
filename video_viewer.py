@@ -53,12 +53,12 @@ class _Capture(threading.Thread):
         self.buf     = deque(np.zeros(WINDOW_SAMPS, dtype=np.float32),
                              maxlen=WINDOW_SAMPS)
         self.lock    = threading.Lock()
-        self._stop   = threading.Event()
+        self._quit   = threading.Event()
         self.error   = None
         self.halves  = 0      # total half-buffers received (for display title)
 
     def stop(self):
-        self._stop.set()
+        self._quit.set()
 
     def run(self):
         try:
@@ -104,7 +104,7 @@ class _Capture(threading.Thread):
         sleep_s = (HALF_SCANS / SAMPLE_RATE) * 0.10   # poll at 10× the half rate
 
         try:
-            while not self._stop.is_set():
+            while not self._quit.is_set():
                 half_ready, _ = dask.AI_AsyncDblBufferHalfReady(card)
                 if half_ready:
                     # Copy the ready half out and release it back to the engine
