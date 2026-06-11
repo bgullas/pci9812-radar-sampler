@@ -32,8 +32,11 @@ if sys.platform != 'win32':
 # USER SETTINGS  ← edit these three values, nothing else needs to change
 # ===========================================================================
 
-SAMPLE_RATE     = 1_000        # S/s — same for ALL 4 channels (HD, BP, TRIG, VIDEO)
-                                #   1_000 = 1 kS/s  (test / low-speed)
+SAMPLE_RATE     = 1_000_000    # S/s — same for ALL 4 channels (HD, BP, TRIG, VIDEO)
+                                #   NOTE: the PCI-9812 is a high-speed 20 MS/s card.
+                                #   Very low rates (e.g. 1 kS/s) are BELOW its timebase
+                                #   range — the DMA stalls and captures nothing.
+                                #   Use 1 MS/s or higher.
                                 #   1_000_000 = 1 MS/s  |  149.9 m range res
                                 #   5_000_000 = 5 MS/s  |   30.0 m range res
                                 #  20_000_000 = 20 MS/s |    7.5 m range res
@@ -266,6 +269,17 @@ class DASK:
         ptr = ctypes.cast(buf, ctypes.c_void_p) if buf is not None else None
         self._dll.AI_AsyncDblBufferTransfer(ctypes.c_int16(card), ptr)
 
+    def AI_AsyncCheck(self, card):
+        """Return (stopped, access_count) — the live count of samples the DMA
+        engine has actually transferred.  Lets us see whether the hardware is
+        sampling even when the half-ready flag has not fired yet."""
+        stopped = ctypes.c_uint16(0)
+        acc     = ctypes.c_uint32(0)
+        self._dll.AI_AsyncCheck(
+            ctypes.c_int16(card), ctypes.byref(stopped), ctypes.byref(acc)
+        )
+        return bool(stopped.value), acc.value
+
     def AI_AsyncClear(self, card):
         count = ctypes.c_uint32(0)
         err   = self._dll.AI_AsyncClear(
@@ -297,6 +311,8 @@ class DASK:
         d.AI_ContScanChannelsToFile.restype   = I16
         d.AI_AsyncDblBufferHalfReady.argtypes = [I16, ctypes.POINTER(U16), ctypes.POINTER(U16)]
         d.AI_AsyncDblBufferHalfReady.restype  = I16
+        d.AI_AsyncCheck.argtypes              = [I16, ctypes.POINTER(U16), ctypes.POINTER(U32)]
+        d.AI_AsyncCheck.restype               = I16
         d.AI_AsyncDblBufferTransfer.argtypes  = [I16, ctypes.c_void_p]
         d.AI_AsyncDblBufferTransfer.restype   = I16
         d.AI_AsyncClear.argtypes              = [I16, ctypes.POINTER(U32)]
@@ -406,8 +422,15 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
 
     print(f'Acquiring for {duration_s:.0f}s  '
           f'(half-buffer ≈ {half_period_s*1000:.0f} ms) …')
+    hw_count = 0
     while time.monotonic() < deadline:
         half_ready, f_stop = dask.AI_AsyncDblBufferHalfReady(card)
+        # Probe the live hardware transfer counter — confirms whether the card
+        # is actually sampling even before a half completes.
+        try:
+            _stopped, hw_count = dask.AI_AsyncCheck(card)
+        except Exception:
+            pass
         if half_ready:
             # The DMA fills the OTHER half while we copy this one.  Halves
             # alternate starting from half 0.
@@ -418,9 +441,13 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
             current_half ^= 1
             elapsed = duration_s - (deadline - time.monotonic())
             got     = len(chunks) * half_count // n_ch
-            print(f'\r  {got:>12,} scans  |  {elapsed:.1f} / {duration_s:.0f} s',
-                  end='', flush=True)
+            print(f'\r  {got:>12,} scans  |  hw={hw_count:>12,}  |  '
+                  f'{elapsed:.1f} / {duration_s:.0f} s', end='', flush=True)
         else:
+            elapsed = duration_s - (deadline - time.monotonic())
+            print(f'\r  {len(chunks)*half_count//n_ch:>12,} scans  |  '
+                  f'hw={hw_count:>12,}  |  {elapsed:.1f} / {duration_s:.0f} s  '
+                  f'(waiting for half)', end='', flush=True)
             time.sleep(sleep_s)
         if f_stop:
             print('\n  [warning] card stopped (buffer overrun) — '
@@ -601,6 +628,17 @@ if __name__ == '__main__':
         channel, ad_range, file_name, read_count, sample_rate,
         card_num=card_num, duration_s=duration_s,
     )
+
+    # Guard against an empty capture (card stalled / rate out of range) so we
+    # print a useful message instead of crashing on v.min() of a 0-size array.
+    n_samples = len(ch_data[0]) if ch_data else 0
+    if n_samples == 0:
+        print('\n  NO DATA CAPTURED — the DMA never delivered a buffer.')
+        print('  Most likely the sample rate is outside the PCI-9812 timebase '
+              'range (it is a 20 MS/s card; very low rates such as 1 kS/s stall).')
+        print(f'  Try SAMPLE_RATE = 1_000_000 (1 MS/s) or higher.  '
+              f'Current = {_fmt_rate(sample_rate)}.')
+        raise SystemExit(1)
 
     print('\nChannel statistics:')
     for ch, v in ch_data.items():
