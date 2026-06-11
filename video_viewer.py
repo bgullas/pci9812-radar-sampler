@@ -96,10 +96,29 @@ class _Capture(threading.Thread):
         half_buf = np.zeros(HALF_COUNT, dtype=np.uint16)
         half_ptr = half_buf.ctypes.data_as(ctypes.c_void_p)
 
-        dask.AI_ContScanChannels(
-            card, N_CH - 1, AD_B_5_V, main_ptr,
-            READ_COUNT, float(SAMPLE_RATE), ASYNCH_OP,
-        )
+        # AI_ContScanChannels is present in current pci9812_sampler.py but may
+        # be missing from older local copies — call the DLL directly as fallback.
+        if hasattr(dask, 'AI_ContScanChannels'):
+            dask.AI_ContScanChannels(
+                card, N_CH - 1, AD_B_5_V, main_ptr,
+                READ_COUNT, float(SAMPLE_RATE), ASYNCH_OP,
+            )
+        else:
+            fn = dask._dll.AI_ContScanChannels
+            fn.argtypes = [
+                ctypes.c_int16, ctypes.c_uint16, ctypes.c_uint16,
+                ctypes.POINTER(ctypes.c_uint16),
+                ctypes.c_uint32, ctypes.c_double, ctypes.c_uint16,
+            ]
+            fn.restype = ctypes.c_int16
+            err = fn(
+                ctypes.c_int16(card), ctypes.c_uint16(N_CH - 1),
+                ctypes.c_uint16(AD_B_5_V), main_ptr,
+                ctypes.c_uint32(READ_COUNT), ctypes.c_double(float(SAMPLE_RATE)),
+                ctypes.c_uint16(ASYNCH_OP),
+            )
+            if err:
+                raise RuntimeError(f'AI_ContScanChannels error={err}')
 
         sleep_s = (HALF_SCANS / SAMPLE_RATE) * 0.10   # poll at 10× the half rate
 
