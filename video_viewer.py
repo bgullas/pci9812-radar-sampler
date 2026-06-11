@@ -204,8 +204,19 @@ class _Capture(threading.Thread):
         dll.start_to_file(card, base)
         print(f'  AI_ContScanChannelsToFile started → {dat}')
         print(f'  read_count={READ_COUNT}  {SAMPLE_RATE} S/s  half≈{HALF_MS:.0f} ms')
-        print('  Polling...')
 
+        # Wait 500 ms then check whether the file exists and hw_count is rising
+        time.sleep(0.5)
+        _fsize0 = os.path.getsize(dat) if os.path.exists(dat) else -1
+        _hw0    = dll.hw_count(card)
+        print(f'  [+500 ms]  hw_count={_hw0}  dat_size={_fsize0} B')
+        if _fsize0 < 0:
+            print('  WARNING: .dat file was NOT created — driver may have rejected the path')
+        if _hw0 == 0 and _fsize0 <= 0:
+            print('  DMA has not started. Try running as Administrator, or check')
+            print('  the ADLINK Device Manager test panel.')
+
+        print('  Polling...')
         sleep_s  = HALF_MS / 1000 * 0.10
         last_hb  = time.monotonic()
         HB_S     = 2.0
@@ -227,7 +238,6 @@ class _Capture(threading.Thread):
                             file_pos = fsize
 
                             raw = np.frombuffer(chunk, dtype=np.uint16)
-                            # Trim to complete scans then extract CH3
                             raw   = raw[: (len(raw) // N_CH) * N_CH]
                             ch3   = raw[VIDEO_CH::N_CH].astype(np.float32)
                             volts = (ch3 - ADC_MID_F) / ADC_MID_F * VOLTAGE_RANGE
@@ -245,9 +255,10 @@ class _Capture(threading.Thread):
                 else:
                     now = time.monotonic()
                     if now - last_hb >= HB_S:
-                        hw = dll.hw_count(card)
+                        hw    = dll.hw_count(card)
+                        fsize = os.path.getsize(dat) if os.path.exists(dat) else -1
                         print(f'  waiting...  hw_count={hw}  '
-                              f'halves={self.halves}  file={file_pos} B',
+                              f'halves={self.halves}  dat={fsize} B',
                               flush=True)
                         last_hb = now
                     time.sleep(sleep_s)
