@@ -218,6 +218,8 @@ class DASK:
         d.AI_ContScanChannels.restype         = I16
         d.AI_AsyncDblBufferHalfReady.argtypes = [I16, PU16, PU16]
         d.AI_AsyncDblBufferHalfReady.restype  = I16
+        d.AI_AsyncDblBufferTransfer.argtypes  = [I16, ctypes.c_void_p]
+        d.AI_AsyncDblBufferTransfer.restype   = I16
         d.AI_AsyncClear.argtypes              = [I16, PU32]
         d.AI_AsyncClear.restype               = I16
         d.Release_Card.argtypes               = [I16]
@@ -257,6 +259,14 @@ class DASK:
         self._dll.AI_AsyncDblBufferHalfReady(
             ctypes.c_int16(card), ctypes.byref(hr), ctypes.byref(fs))
         return bool(hr.value), bool(fs.value)
+
+    def AI_AsyncDblBufferTransfer(self, card, dest_ptr):
+        # Copy the ready half into dest_ptr AND release it back to the
+        # double-buffer engine.  Without this call the engine stalls after a
+        # tiny fill and HalfReady never fires again.
+        e = self._dll.AI_AsyncDblBufferTransfer(ctypes.c_int16(card), dest_ptr)
+        if e:
+            raise RuntimeError(f'AI_AsyncDblBufferTransfer error={e}')
 
     def AI_AsyncClear(self, card):
         cnt = ctypes.c_uint32(0)
@@ -410,10 +420,14 @@ class AcquisitionThread(threading.Thread):
         self.status    = 'starting'
         self._stop_evt = threading.Event()
 
-        self._buf     = np.zeros(cfg.read_count, dtype=np.uint16)
-        self._buf_ptr = self._buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        self._dask    = None
-        self._card    = None
+        self._buf      = np.zeros(cfg.read_count, dtype=np.uint16)
+        self._buf_ptr  = self._buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        # Destination for AI_AsyncDblBufferTransfer — the driver copies the
+        # ready half into this buffer (one half).
+        self._half     = np.zeros(cfg.half_count, dtype=np.uint16)
+        self._half_ptr = self._half.ctypes.data_as(ctypes.c_void_p)
+        self._dask     = None
+        self._card     = None
 
     def run(self):
         try:
@@ -450,17 +464,15 @@ class AcquisitionThread(threading.Thread):
             )
             self.status = 'acquiring'
 
-            sleep_s      = HALF_PERIOD_S * 0.40
-            current_half = 0
+            sleep_s = HALF_PERIOD_S * 0.40
 
             while not self._stop_evt.is_set():
                 ready, f_stop = self._dask.AI_AsyncDblBufferHalfReady(self._card)
                 if ready:
-                    hc    = self.cfg.half_count
-                    chunk = (self._buf[:hc].copy() if current_half == 0
-                             else self._buf[hc:].copy())
-                    current_half ^= 1
-                    self.processor.process_half(chunk)
+                    # Flush the ready half into self._half AND release it back
+                    # to the engine (essential — without this the DMA stalls).
+                    self._dask.AI_AsyncDblBufferTransfer(self._card, self._half_ptr)
+                    self.processor.process_half(self._half.copy())
                 else:
                     time.sleep(sleep_s)
                 if f_stop:

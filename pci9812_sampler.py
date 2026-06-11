@@ -347,53 +347,53 @@ def _dma_align(n_scans_per_half, n_ch):
 def acquire(channel, ad_range, file_name, read_count, sample_rate,
             card_num=0, duration_s=5.0):
     """
-    Acquire radar data with the in-memory double-buffer DMA path and return a
-    dict of per-channel voltage arrays.
+    Acquire radar data and return a dict of per-channel voltage arrays.
 
-    This uses AI_ContScanChannels (DMA straight into a numpy buffer) — the same
-    proven path as plot_radar.py.  The file-mode variant
-    (AI_ContScanChannelsToFile) does NOT acquire on this card: its half-ready
-    flag never fires and nothing reaches disk.
+    Mirrors the proven working C reference exactly:
+        AI_9812_Config → AI_AsyncDblBufferMode → AI_ContScanChannelsToFile
+        loop: wait AI_AsyncDblBufferHalfReady → AI_AsyncDblBufferTransfer(NULL)
+        AI_AsyncClear → Release_Card → read back the .dat file
+
+    The AI_AsyncDblBufferTransfer(card, NULL) call after every ready half is
+    ESSENTIAL — it flushes the completed half to disk and lets the double-buffer
+    engine advance.  Without it the engine stalls after a tiny fill and the
+    half-ready flag never fires again (the bug that produced 0–13 samples).
 
     channel     : last channel index (e.g. 3 → scans CH0–CH3)
     ad_range    : AD_B_5_V or AD_B_1_V
-    file_name   : kept for signature compatibility; data is NOT written to disk.
-    read_count  : double-buffer size in total uint16 samples (both halves, all
-                  channels).  Call _dma_align() to compute a valid value.
+    file_name   : output base name WITHOUT extension; driver appends '.dat'.
+    read_count  : circular buffer size in total uint16 samples (both halves,
+                  all channels).
     sample_rate : samples/second per channel
     duration_s  : how long to run
     """
-    import math
-
     n_ch   = channel + 1
     vrange = 5.0 if ad_range == AD_B_5_V else 1.0
 
-    # ── Enforce DMA alignment ─────────────────────────────────────────────────
-    # The half-buffer in scans must be a power of 2. Check and fix silently.
-    scans_per_half   = read_count // 2 // n_ch
-    k                = max(9, math.ceil(math.log2(max(scans_per_half, 1))))
-    aligned_scans    = 1 << k
-    aligned_count    = aligned_scans * 2 * n_ch
-    if aligned_count != read_count:
-        print(f'  [DMA align]  read_count {read_count} → {aligned_count}  '
-              f'(scans/half {scans_per_half} → {aligned_scans})')
-        read_count = aligned_count
-
+    # read_count must split evenly into two halves across all channels.
+    read_count = (read_count // (2 * n_ch)) * (2 * n_ch)
     half_count    = read_count // 2                       # uint16 per half
     half_period_s = half_count / (sample_rate * n_ch)
 
-    # DMA target buffer — the card fills this directly.
-    buf     = np.zeros(read_count, dtype=np.uint16)
-    buf_ptr = buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+    # ── Resolve file path to absolute and clear any stale capture ─────────────
+    if not os.path.isabs(file_name):
+        file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 file_name)
+    dat_path = file_name + '.dat'
+    if os.path.exists(dat_path):
+        try:
+            os.remove(dat_path)
+        except OSError as e:
+            print(f'  [warning] could not remove stale {dat_path}: {e}')
 
     print(f'PCI-9812  CH0–CH{channel}  {sample_rate:.0f} S/s  '
-          f'buffer={read_count} ({half_period_s*1000:.0f} ms/half)  in-memory DMA')
+          f'buffer={read_count} ({half_period_s*1000:.0f} ms/half)  → {dat_path}')
 
     dask = DASK()
     card = dask.Register_Card(PCI_9812, card_num)
 
     # Clear any acquisition state left by a previous run that did not exit
-    # cleanly (card stuck "running" causes AI_ContScanChannels to return -15).
+    # cleanly (card stuck "running" causes the next start to return -15).
     try:
         dask.AI_AsyncClear(card)
     except Exception:
@@ -409,63 +409,51 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
         post_count = 0,
     )
     dask.AI_AsyncDblBufferMode(card, enable=True)
-    dask.AI_ContScanChannels(
-        card, channel, ad_range, buf_ptr,
+    dask.AI_ContScanChannelsToFile(
+        card, channel, ad_range, file_name,
         read_count, sample_rate, ASYNCH_OP,
     )
 
-    # ── Poll loop — copy each ready half, alternating, into a chunk list ──────
-    chunks       = []
-    current_half = 0
+    # ── Poll loop — match the C: wait for a ready half, then TRANSFER it ───────
+    count        = 0
     deadline     = time.monotonic() + duration_s
-    sleep_s      = max(0.002, half_period_s * 0.40)
+    sleep_s      = max(0.001, half_period_s * 0.40)
+    hw_count     = 0
+    f_stop_seen  = False
 
     print(f'Acquiring for {duration_s:.0f}s  '
           f'(half-buffer ≈ {half_period_s*1000:.0f} ms) …')
-    hw_count = 0
     while time.monotonic() < deadline:
         half_ready, f_stop = dask.AI_AsyncDblBufferHalfReady(card)
-        # Probe the live hardware transfer counter — confirms whether the card
-        # is actually sampling even before a half completes.
         try:
             _stopped, hw_count = dask.AI_AsyncCheck(card)
         except Exception:
             pass
         if half_ready:
-            # The DMA fills the OTHER half while we copy this one.  Halves
-            # alternate starting from half 0.
-            if current_half == 0:
-                chunks.append(buf[:half_count].copy())
-            else:
-                chunks.append(buf[half_count:].copy())
-            current_half ^= 1
+            # THE essential call — flush the ready half to the .dat file and
+            # release it back to the double-buffer engine.
+            dask.AI_AsyncDblBufferTransfer(card, None)
+            count += half_count
             elapsed = duration_s - (deadline - time.monotonic())
-            got     = len(chunks) * half_count // n_ch
-            print(f'\r  {got:>12,} scans  |  hw={hw_count:>12,}  |  '
+            print(f'\r  {count // n_ch:>12,} scans  |  hw={hw_count:>12,}  |  '
                   f'{elapsed:.1f} / {duration_s:.0f} s', end='', flush=True)
         else:
-            elapsed = duration_s - (deadline - time.monotonic())
-            print(f'\r  {len(chunks)*half_count//n_ch:>12,} scans  |  '
-                  f'hw={hw_count:>12,}  |  {elapsed:.1f} / {duration_s:.0f} s  '
-                  f'(waiting for half)', end='', flush=True)
             time.sleep(sleep_s)
-        if f_stop:
-            print('\n  [warning] card stopped (buffer overrun) — '
-                  'host too slow for this rate; stopping capture')
-            break
+        if f_stop and not f_stop_seen:
+            f_stop_seen = True   # note overrun but keep going, like the C
 
     total = dask.AI_AsyncClear(card)
     dask.Release_Card(card)
 
-    # ── Assemble, deinterleave, convert to volts ─────────────────────────────
-    if chunks:
-        raw = np.concatenate(chunks)
-    else:
-        raw = np.empty(0, dtype=np.uint16)
+    # ── Read back, deinterleave, convert to volts ─────────────────────────────
+    raw = np.fromfile(dat_path, dtype=np.uint16)
     raw = raw[: len(raw) // n_ch * n_ch]
     samples_per_ch = len(raw) // n_ch
+    file_kb = (os.path.getsize(dat_path) // 1024) if os.path.exists(dat_path) else 0
     print(f'\n  captured: {len(raw)} uint16  →  {samples_per_ch} scans/ch  ≈  '
-          f'{samples_per_ch / sample_rate:.2f} s  (AI_AsyncClear total={total})')
+          f'{samples_per_ch / sample_rate:.2f} s  '
+          f'(file {file_kb} KB, AI_AsyncClear total={total}'
+          f'{", overrun seen" if f_stop_seen else ""})')
     result = {}
     for ch in range(n_ch):
         raw_ch     = raw[ch::n_ch].astype(np.float32)
