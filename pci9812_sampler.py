@@ -406,8 +406,11 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
     print(f'\n{count} samples written  (AI_AsyncClear total={total})')
     print(f'  file: {dat_path}  ({os.path.getsize(dat_path)//1024//1024} MB)')
 
-    # Read back and convert to volts
-    raw    = np.fromfile(dat_path, dtype=np.int16)
+    # Read back and convert to volts.
+    # Trim to the nearest complete scan so every channel has the same length
+    # (the DMA can stop mid-scan, leaving a non-multiple-of-n_ch file size).
+    raw = np.fromfile(dat_path, dtype=np.int16)
+    raw = raw[: len(raw) // n_ch * n_ch]
     result = {}
     for ch in range(n_ch):
         raw_ch     = raw[ch::n_ch].astype(np.float32)
@@ -471,41 +474,40 @@ _OVERVIEW_DECIMATE = 200   # plot every Nth sample in the 15-s overview
 _ZOOM_MS           = 50    # milliseconds shown in the zoom panel
 
 def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
-    """
-    Three-figure radar signal display:
-      Fig 1 — Overview  : full 15-s, all 4 channels, decimated for speed
-      Fig 2 — Zoom      : first _ZOOM_MS ms, all 4 channels, full resolution
-      Fig 3 — FFT       : VIDEO channel (CH0) frequency spectrum
-    """
-    n_ch   = len(ch_data)
-    dt     = 1.0 / sample_rate
-    total  = len(ch_data[0])
+    """Single time-series figure — all channels vs time for the full capture."""
+    n_ch  = len(ch_data)
+    dt    = 1.0 / sample_rate
+    total = len(ch_data[0])
 
-    # Detect trigger pulses from CH2 (TRIG) for annotation
     if CH_TRIG in ch_data:
         trig_idx, prf = detect_triggers(ch_data[CH_TRIG], sample_rate)
         prf_str = f'PRF ≈ {prf:.0f} Hz' if prf > 0 else 'PRF: n/a'
     else:
         trig_idx, prf_str = np.array([]), ''
 
-    # ── Figure 1 : Overview ──────────────────────────────────────────────────
-    fig1, axes1 = plt.subplots(n_ch, 1, figsize=(15, 2.6 * n_ch),
-                               sharex=True, facecolor='#0a0a14')
-    fig1.suptitle(
-        f'PCI-9812  Radar Signals  —  Overview  '
-        f'({sample_rate/1e6:.1f} MS/s  ·  {duration_s:.0f} s  ·  {prf_str})',
+    def _fmt_rate(hz):
+        if hz >= 1e6:  return f'{hz/1e6:.4g} MS/s'
+        if hz >= 1e3:  return f'{hz/1e3:.4g} kS/s'
+        return f'{hz:.0f} S/s'
+
+    # Decimate for plotting only — keeps rendering fast for long captures
+    decimate = max(1, total // 200_000)
+    t = np.arange(0, total, decimate) * dt
+
+    fig, axes = plt.subplots(n_ch, 1, figsize=(15, 2.6 * n_ch),
+                              sharex=True, facecolor='#0a0a14')
+    fig.suptitle(
+        f'PCI-9812  Radar Signals  —  {_fmt_rate(sample_rate)}  ·  '
+        f'{duration_s:.0f} s  ·  {prf_str}',
         fontsize=11, color='#d0e8d0',
     )
     if n_ch == 1:
-        axes1 = [axes1]
+        axes = [axes]
 
-    t_ov = np.arange(0, total, _OVERVIEW_DECIMATE) * dt   # decimated time axis (s)
-
-    for ch, ax in enumerate(axes1):
+    for ch, ax in enumerate(axes):
         ax.set_facecolor('#04060e')
-        v_dec = ch_data[ch][::_OVERVIEW_DECIMATE]
-        # VIDEO (CH3) in green; digital pulse channels in blue
-        ax.plot(t_ov, v_dec, lw=0.5, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
+        ax.plot(t, ch_data[ch][::decimate],
+                lw=0.6, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
         ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
                       color='#80b080', fontsize=7.5)
         ax.set_ylim(-vrange * 1.05, vrange * 1.05)
@@ -514,91 +516,12 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
         ax.spines[:].set_color('#1a2a2a')
         ax.grid(True, alpha=0.15, color='#304050')
 
-        # Mark TRIG pulse positions on all channels (shows sweep cadence)
         if len(trig_idx) > 0:
             for ti in trig_idx[::max(1, len(trig_idx) // 200)]:
                 ax.axvline(ti * dt, color='#ff8030', lw=0.3, alpha=0.25)
 
-    axes1[-1].set_xlabel('Time (s)', color='#5080a0', fontsize=8)
-    # Mark approximate antenna revolution period
-    rev_period = 60.0 / 42          # 42 RPM → 1.43 s
-    for rev in np.arange(rev_period, duration_s, rev_period):
-        for ax in axes1:
-            ax.axvline(rev, color='#604020', lw=0.6, ls=':', alpha=0.6)
-    axes1[0].text(rev_period / 2, vrange * 0.88, '← 1 rev →',
-                  color='#806040', fontsize=7, ha='center')
-
+    axes[-1].set_xlabel('Time (s)', color='#5080a0', fontsize=8)
     plt.tight_layout()
-
-    # ── Figure 2 : Zoom ───────────────────────────────────────────────────────
-    zoom_n  = min(int(_ZOOM_MS * 1e-3 * sample_rate), total)
-    t_zoom  = np.arange(zoom_n) * dt * 1e3            # ms
-
-    fig2, axes2 = plt.subplots(n_ch, 1, figsize=(15, 2.6 * n_ch),
-                               sharex=True, facecolor='#0a0a14')
-    fig2.suptitle(
-        f'PCI-9812  Radar Signals  —  First {_ZOOM_MS} ms  '
-        f'(range res. = {299792458 / (2*sample_rate):.1f} m/sample)',
-        fontsize=11, color='#d0e8d0',
-    )
-    if n_ch == 1:
-        axes2 = [axes2]
-
-    for ch, ax in enumerate(axes2):
-        ax.set_facecolor('#04060e')
-        ax.plot(t_zoom, ch_data[ch][:zoom_n],
-                lw=0.7, color='#40c060' if ch == CH_VIDEO else '#60a0ff')
-        ax.set_ylabel(CH_LABELS.get(ch, f'CH{ch}') + '\n(V)',
-                      color='#80b080', fontsize=7.5)
-        ax.set_ylim(-vrange * 1.05, vrange * 1.05)
-        ax.axhline(0, color='#1a2a1a', lw=0.4, ls='--')
-        ax.tick_params(colors='#304050', labelsize=7)
-        ax.spines[:].set_color('#1a2a2a')
-        ax.grid(True, alpha=0.15, color='#304050')
-
-        # Mark TRIG pulses in the zoom window
-        for ti in trig_idx[trig_idx < zoom_n]:
-            ax.axvline(ti * dt * 1e3, color='#ff4040', lw=0.8,
-                       alpha=0.55, zorder=5)
-
-    axes2[-1].set_xlabel('Time (ms)', color='#5080a0', fontsize=8)
-
-    # Range-calibration ticks on VIDEO (CH3) x-axis
-    c      = 299_792_458
-    r_res  = c / (2 * sample_rate)          # m per sample
-    r_nms  = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-    for r_nm in r_nms:
-        r_m    = r_nm * 1852
-        t_ms   = r_m / (c / 2) * 1e3       # two-way travel time in ms
-        if t_ms < _ZOOM_MS:
-            axes2[CH_VIDEO].axvline(t_ms, color='#808020', lw=0.7,
-                                    ls='--', alpha=0.55)
-            axes2[CH_VIDEO].text(t_ms, vrange * 0.75, f'{r_nm} NM',
-                                 color='#a0a030', fontsize=6, ha='center')
-
-    plt.tight_layout()
-
-    # ── Figure 3 : FFT of VIDEO channel (CH3) ────────────────────────────────
-    v       = ch_data[CH_VIDEO]
-    N_fft   = min(len(v), 4 * 1024 * 1024)   # cap at 4 M points for speed
-    win     = np.hanning(N_fft)
-    sp      = np.abs(np.fft.rfft(v[:N_fft] * win)) * 2 / N_fft
-    f_khz   = np.fft.rfftfreq(N_fft, d=dt) / 1e3
-
-    fig3, ax3 = plt.subplots(figsize=(13, 4), facecolor='#0a0a14')
-    ax3.set_facecolor('#04060e')
-    ax3.plot(f_khz, 20 * np.log10(sp + 1e-9), lw=0.6, color='#40c060')
-    ax3.set_xlim(0, sample_rate / 2 / 1e3)
-    ax3.set_ylim(-90, 5)
-    ax3.set_xlabel('Frequency (kHz)', color='#5080a0', fontsize=9)
-    ax3.set_ylabel('Amplitude (dBV)', color='#5080a0', fontsize=9)
-    ax3.set_title('VIDEO Channel (CH3) — Frequency Spectrum  |  Hanning window',
-                  color='#80b0d0', fontsize=10)
-    ax3.tick_params(colors='#304050', labelsize=7)
-    ax3.spines[:].set_color('#1a2a2a')
-    ax3.grid(True, alpha=0.15, color='#304050')
-    fig3.tight_layout()
-
     plt.show()
 
 
