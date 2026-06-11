@@ -26,7 +26,7 @@ from pci9812_sampler import (
 )
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-SAMPLE_RATE   = 1_000      # S/s — scans per second (all 4 channels simultaneously)
+SAMPLE_RATE   = 20_000     # S/s — scans per second (all 4 channels simultaneously)
 VOLTAGE_RANGE = 5.0        # ±5 V
 WINDOW_S      = 1.0        # seconds shown in the rolling window
 CARD_NUM      = 0
