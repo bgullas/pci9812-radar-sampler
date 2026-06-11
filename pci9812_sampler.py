@@ -540,11 +540,24 @@ if __name__ == '__main__':
     channel   = 3     # scans CH0–CH3 simultaneously
     file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
 
-    # ── Compute DMA buffer (capped to driver limit) ───────────────────────────
+    # ── Compute DMA buffer sized to capture the full duration ─────────────────
+    # read_count = aligned_half * 2 * n_ch must satisfy:
+    #   read_count / n_ch / sample_rate  >=  duration_s   (covers full capture)
+    #   read_count * 2 bytes             <=  driver DMA limit (no error -15)
     n_ch = channel + 1
     driver_max_scans_half = (DRIVER_DMA_LIMIT_MB * 1024 * 1024 // 2) // (n_ch * 2)
-    target_scans_half     = int(0.5 * sample_rate)
-    read_count = _dma_align(min(target_scans_half, driver_max_scans_half), n_ch)
+    total_scans       = int(duration_s * sample_rate)
+    half_scans_needed = (total_scans + 1) // 2
+    half_scans_capped = min(half_scans_needed, driver_max_scans_half)
+    read_count  = _dma_align(half_scans_capped, n_ch)
+    actual_s    = read_count / n_ch / sample_rate   # true capture length
+    timeout_s   = actual_s + 10                     # safety deadline for acquire()
+
+    if half_scans_needed > driver_max_scans_half:
+        print(f'  WARNING: duration requires {half_scans_needed * 2 * n_ch * 2 // 1024} KB DMA buffer '
+              f'but driver limit is {DRIVER_DMA_LIMIT_MB} MB. '
+              f'Capture will be truncated to {actual_s:.1f} s. '
+              f'Increase DRIVER_DMA_LIMIT_MB in ADLINK Device Manager.')
 
     def _fmt_rate(hz):
         if hz >= 1e6:  return f'{hz/1e6:.4g} MS/s'
@@ -554,14 +567,14 @@ if __name__ == '__main__':
     half_period_ms = (read_count // 2) / (sample_rate * n_ch) * 1000
     print(f'  rate = {_fmt_rate(sample_rate)}  |  '
           f'±{vrange:.0f} V  |  '
-          f'duration = {duration_s:.0f} s  |  '
+          f'capture = {actual_s:.1f} s  |  '
           f'buf = {read_count} ({read_count*2//1024} KB)  |  '
           f'half ≈ {half_period_ms:.0f} ms')
 
     # ── Run acquisition ───────────────────────────────────────────────────────
     ch_data, sr = acquire(
         channel, ad_range, file_name, read_count, sample_rate,
-        card_num=card_num, duration_s=duration_s,
+        card_num=card_num, duration_s=timeout_s,
     )
 
     print('\nChannel statistics:')
