@@ -173,7 +173,8 @@ def _find_dll():
 
 def _load_const():
     needed = ['PCI_9812', 'AD_B_5_V', 'P9812_TRGMOD_SOFT', 'P9812_TRGSRC_CH0',
-              'P9812_TRGSLP_POS', 'P9812_AD2_GT_PCI', 'P9812_CLKSRC_INT', 'ASYNCH_OP']
+              'P9812_TRGSRC_CH2', 'P9812_TRGSLP_POS', 'P9812_AD2_GT_PCI',
+              'P9812_CLKSRC_INT', 'ASYNCH_OP']
     pat = re.compile(
         r'^\s*#define\s+(' + '|'.join(re.escape(n) for n in needed) +
         r')\s+(0[xX][0-9a-fA-F]+|\d+)', re.MULTILINE)
@@ -195,6 +196,7 @@ PCI_9812          = _c('PCI_9812',          30)
 AD_B_5_V          = _c('AD_B_5_V',           1)
 P9812_TRGMOD_SOFT = _c('P9812_TRGMOD_SOFT',  0)
 P9812_TRGSRC_CH0  = _c('P9812_TRGSRC_CH0',   0)
+P9812_TRGSRC_CH2  = _c('P9812_TRGSRC_CH2',   2)
 P9812_TRGSLP_POS  = _c('P9812_TRGSLP_POS',   0)
 P9812_AD2_GT_PCI  = _c('P9812_AD2_GT_PCI',   0x0002)
 P9812_CLKSRC_INT  = _c('P9812_CLKSRC_INT',   0x0000)
@@ -446,7 +448,7 @@ class AcquisitionThread(threading.Thread):
             self._dask.AI_9812_Config(
                 self._card,
                 tm  = P9812_TRGMOD_SOFT,
-                ts  = P9812_TRGSRC_CH0,
+                ts  = P9812_TRGSRC_CH2,   # matches the working C reference
                 tsl = P9812_TRGSLP_POS,
                 at  = P9812_AD2_GT_PCI | P9812_CLKSRC_INT,
                 tl  = 0x80,

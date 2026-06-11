@@ -32,11 +32,10 @@ if sys.platform != 'win32':
 # USER SETTINGS  ← edit these three values, nothing else needs to change
 # ===========================================================================
 
-SAMPLE_RATE     = 1_000_000    # S/s — same for ALL 4 channels (HD, BP, TRIG, VIDEO)
-                                #   NOTE: the PCI-9812 is a high-speed 20 MS/s card.
-                                #   Very low rates (e.g. 1 kS/s) are BELOW its timebase
-                                #   range — the DMA stalls and captures nothing.
-                                #   Use 1 MS/s or higher.
+SAMPLE_RATE     = 44_100       # S/s — same for ALL 4 channels (HD, BP, TRIG, VIDEO)
+                                #   44_100 = exactly matches the proven-working C
+                                #   reference — start here to confirm the capture
+                                #   pipeline, then raise it for finer range res:
                                 #   1_000_000 = 1 MS/s  |  149.9 m range res
                                 #   5_000_000 = 5 MS/s  |   30.0 m range res
                                 #  20_000_000 = 20 MS/s |    7.5 m range res
@@ -402,7 +401,7 @@ def acquire(channel, ad_range, file_name, read_count, sample_rate,
     dask.AI_9812_Config(
         card,
         trig_mod   = P9812_TRGMOD_SOFT,
-        trig_src   = P9812_TRGSRC_CH0,
+        trig_src   = P9812_TRGSRC_CH2,   # matches the working C reference
         trig_slp   = P9812_TRGSLP_POS,
         ad_timing  = P9812_AD2_GT_PCI | P9812_CLKSRC_INT,
         trig_level = 0x80,
