@@ -583,35 +583,51 @@ def plot_radar_signals(ch_data, sample_rate, vrange, duration_s):
 
 if __name__ == '__main__':
     # ── Acquisition parameters ────────────────────────────────────────────────
-    card_num    = 0              # 0 = first card
+    card_num   = 0
+    channel    = 3          # last channel index → scans CH0–CH3 simultaneously
+    ad_range   = AD_B_5_V   # ±5 V (covers VIDEO ≈ 4 Vp-p and 12 V digital pulses)
+    file_name  = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
+    duration_s = 15.0
 
-    # Scan CH0–CH3 simultaneously (HD, BP, TRIG, VIDEO)
-    channel   = 3                # last channel index → scans CH0-CH3
-    ad_range  = AD_B_5_V         # ±5 V — covers VIDEO (≈4 Vp-p) and digital pulses
-    # Use absolute path — PCIS-DASK resolves relative paths from the DLL
-    # directory, not the script's CWD, which can silently fail (error -15).
-    file_name = os.path.join(os.path.dirname(os.path.abspath(__file__)), '9812d')
-
-    # VIDEO sampling rate — all 4 channels run at this clock rate simultaneously.
-    # Increase for better range resolution on the VIDEO channel (CH3):
+    # ── Sampling rate  (same for ALL four channels — HD, BP, TRIG, VIDEO) ────
     #
-    #   sample_rate   Range res    Bins / 3 NM   File size / 15 s
-    #   ───────────   ─────────    ───────────   ────────────────
-    #   1_000_000     149.9 m           41         ~120 MB
-    #   2_000_000      75.0 m           80         ~240 MB
-    #   5_000_000      30.0 m          189         ~600 MB
-    #  10_000_000      15.0 m          374        ~1200 MB
-    #  20_000_000       7.5 m          745        ~2400 MB
+    # The PCI-9812 has one shared clock: every channel is sampled at exactly
+    # this rate.  Higher rates give finer range resolution on the VIDEO channel.
     #
-    sample_rate = 1_000_000.0    # ← change this (1_000_000 to 20_000_000)
+    #   sample_rate   Range res (VIDEO)   File size / 15 s
+    #   ───────────   ─────────────────   ────────────────
+    #   1_000_000          149.9 m            ~120 MB
+    #   2_000_000           75.0 m            ~240 MB
+    #   5_000_000           30.0 m            ~600 MB
+    #  10_000_000           15.0 m           ~1200 MB
+    #  20_000_000            7.5 m           ~2400 MB
+    #
+    sample_rate = 1_000_000.0   # ← change this (1_000_000 to 20_000_000)
 
-    # Buffer size: half-period ≈ 0.5 s, then DMA-aligned to the next power of 2
-    # in scans.  _dma_align() rounds up so the half-buffer is always a power-of-2
-    # multiple of 512 scans — required by the PCI-9812 DMA engine.
-    n_ch       = channel + 1
-    read_count = _dma_align(int(0.5 * sample_rate), n_ch)   # auto DMA-aligned
+    # ── Driver DMA buffer limit ───────────────────────────────────────────────
+    # Set DRIVER_DMA_LIMIT_MB to the value configured in the ADLINK Device
+    # Manager (PCI-9812 → Properties → DMA Buffer Size).  The default after
+    # installation is 1 MB.  If read_count would exceed this limit the driver
+    # returns error -15.
+    #
+    # Required minimum per rate (to keep half-period ≈ 0.5 s):
+    #   1 MS/s  →  8 MB   |   5 MS/s  →  64 MB   |  20 MS/s  → 256 MB
+    #
+    # With 1 MB (default), half-period = 65 ms at all rates — still correct,
+    # just more frequent disk writes.  Increase the driver setting and this
+    # value together to get longer half-periods and fewer writes.
+    DRIVER_DMA_LIMIT_MB = 1     # ← match your ADLINK driver DMA Buffer setting
 
-    duration_s  = 15.0           # capture duration → file size ≈ sample_rate×4×duration_s×2 bytes
+    # Compute read_count: target ~0.5 s per half, capped to the driver limit.
+    n_ch = channel + 1
+    driver_max_scans_half = (DRIVER_DMA_LIMIT_MB * 1024 * 1024 // 2) // (n_ch * 2)
+    target_scans_half     = int(0.5 * sample_rate)
+    read_count = _dma_align(min(target_scans_half, driver_max_scans_half), n_ch)
+
+    half_period_ms = (read_count // 2) / (sample_rate * n_ch) * 1000
+    print(f'  sample_rate = {sample_rate/1e6:.0f} MS/s  |  '
+          f'read_count = {read_count} ({read_count*2//1024} KB)  |  '
+          f'half-period ≈ {half_period_ms:.0f} ms')
 
     # ── Run acquisition ───────────────────────────────────────────────────────
     ch_data, sr = acquire(
