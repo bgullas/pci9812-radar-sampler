@@ -81,6 +81,7 @@ class _DLL:
         F64 = ctypes.c_double
 
         d.Register_Card.argtypes              = [U16, U16];            d.Register_Card.restype = I16
+        d.AI_InitialMemoryAllocated.argtypes  = [I16, ctypes.POINTER(U32)]; d.AI_InitialMemoryAllocated.restype = I16
         d.AI_9812_Config.argtypes             = [I16, U16, U16, U16, U16, U16, U32]; d.AI_9812_Config.restype = I16
         d.AI_AsyncDblBufferMode.argtypes      = [I16, U16];            d.AI_AsyncDblBufferMode.restype = I16
         d.AI_ContScanChannelsToFile.argtypes  = [I16, U16, U16, ctypes.c_char_p, U32, F64, U16]; d.AI_ContScanChannelsToFile.restype = I16
@@ -90,6 +91,11 @@ class _DLL:
         d.AI_AsyncClear.argtypes              = [I16, ctypes.POINTER(U32)]; d.AI_AsyncClear.restype = I16
         d.Release_Card.argtypes               = [I16];                 d.Release_Card.restype = I16
         self._d = d
+
+    def initial_mem(self, card):
+        mem = ctypes.c_uint32(0)
+        self._d.AI_InitialMemoryAllocated(ctypes.c_int16(card), ctypes.byref(mem))
+        return mem.value   # KB
 
     def register_card(self):
         h = self._d.Register_Card(ctypes.c_uint16(PCI_9812),
@@ -187,10 +193,19 @@ class _Capture(threading.Thread):
         except Exception:
             pass
 
-        dll.config(card)
-        print('  AI_9812_Config OK  (SOFT / free-run)')
+        # Query driver DMA memory (required step per ADLINK generated code)
+        mem_kb = dll.initial_mem(card)
+        print(f'  AI_InitialMemoryAllocated: {mem_kb} KB')
+        need_kb = READ_COUNT * 2 // 1024 + 1
+        if mem_kb < need_kb:
+            print(f'  WARNING: driver has only {mem_kb} KB; need {need_kb} KB. '
+                  f'Increase DMA buffer in ADLINK Device Manager.')
+
+        # Order per ADLINK generated code: DblBufferMode THEN Config
         dll.dbl_buf_mode(card)
         print('  AI_AsyncDblBufferMode OK')
+        dll.config(card)
+        print('  AI_9812_Config OK  (SOFT / free-run)')
 
         # Resolve absolute base path (driver appends .dat)
         base = os.path.join(_SCRIPT_DIR, DAT_BASE)
